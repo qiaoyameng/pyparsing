@@ -1538,6 +1538,71 @@ class ParserElement(ABC):
             # catch and re-raise exception from here, clears out pyparsing internal stack trace
             raise exc.with_traceback(None)
 
+    def create_patch_plan(
+        self,
+        instring: str,
+        max_matches: int = _MAX_INT,
+        *,
+        overlap: str = "reject",
+        debug: bool = False,
+    ):
+        """
+        Extension to :class:`scan_string`, building a reviewable
+        :class:`PatchPlan` of the replacements that :class:`transform_string`
+        would perform.  Instead of immediately rewriting the input string,
+        each match is reported as a :class:`Patch` holding its span (as
+        offsets into the original string), the original text, and the
+        replacement text computed from the parse actions.  The caller can
+        then review the plan and apply all or just a selected subset of the
+        patches; unselected matches are left unchanged.
+
+        Positions are always reported relative to the original input string,
+        even when embedded tabs are expanded for parsing, and text outside
+        the matched spans (including tabs, ignored comments, and CRLF line
+        endings) is preserved exactly when the plan is applied.
+
+        The plan is bound to the input string by a SHA-256 digest, so it
+        cannot be applied to a different string.  Nested or overlapping
+        patches are handled according to the ``overlap`` policy: ``"reject"``
+        (default, raises :class:`OverlappingPatchError`), ``"first"`` (keep
+        the earliest patch of each overlapping group), or ``"last"`` (keep
+        the latest).
+
+        Example:
+
+        .. testcode::
+
+            quote = "now is the winter of our discontent"
+
+            wd = Word(alphas)
+            wd.set_parse_action(lambda toks: toks[0].title())
+
+            plan = wd.create_patch_plan(quote)
+            for patch in plan:
+                print(patch.start, patch.end, patch.original, "->", patch.replacement)
+
+            # apply only the patches for "winter" and "discontent"
+            print(plan.apply(lambda patch: patch.original in ("winter", "discontent")))
+
+        prints:
+
+        .. testoutput::
+
+            0 3 now -> Now
+            4 6 is -> Is
+            7 10 the -> The
+            11 17 winter -> Winter
+            18 20 of -> Of
+            21 24 our -> Our
+            25 35 discontent -> Discontent
+            now is the Winter of our Discontent
+        """
+        from .patching import create_patch_plan
+
+        return create_patch_plan(
+            self, instring, max_matches=max_matches, overlap=overlap, debug=debug
+        )
+
     def search_string(
         self,
         instring: str,

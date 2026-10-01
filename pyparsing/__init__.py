@@ -151,6 +151,7 @@ from .core import *
 from .core import _builtin_exprs as core_builtin_exprs
 from .helpers import *
 from .helpers import _builtin_exprs as helper_builtin_exprs
+from .patching import *
 
 from .unicode import unicode_set, UnicodeRangeList, pyparsing_unicode as unicode
 from .testing import pyparsing_test as testing
@@ -275,6 +276,7 @@ __all__ = [
     "Opt",
     "Optional",
     "Or",
+    "OverlappingPatchError",
     "ParseBaseException",
     "ParseElementEnhance",
     "ParseException",
@@ -283,6 +285,10 @@ __all__ = [
     "ParseResults",
     "ParseSyntaxException",
     "ParserElement",
+    "Patch",
+    "PatchPlan",
+    "PatchPlanError",
+    "PatchPlanSourceMismatch",
     "PositionToken",
     "PyparsingDeprecationWarning",
     "PyparsingDiagnosticWarning",
@@ -315,6 +321,7 @@ __all__ = [
     "condition_as_parse_action",
     "counted_array",
     "cpp_style_comment",
+    "create_patch_plan",
     "dbl_quoted_string",
     "dbl_slash_comment",
     "delimited_list",
