@@ -27,6 +27,20 @@ Supported Python versions
 New Features
 ============
 
+- Added deferred commit actions, defined using
+  ``ParserElement.set_commit_action()`` and ``ParserElement.add_commit_action()``.
+  Commit actions use the same call signatures as parse actions, but instead of
+  running when their expression matches, they are registered during the parse and
+  only executed after the complete parse succeeds (including any ``parse_all=True``
+  check). Commit actions registered by parse branches that later fail (losing
+  alternatives of ``MatchFirst``/``Or``, failed ``Optional`` or repetition
+  matches, or matches whose enclosing expression fails) are discarded, and
+  packrat cache hits do not cause duplicate executions. Commit actions are
+  intended for side effects that must only happen once the parse is known to
+  have succeeded, such as registering symbols in an external symbol table. If a
+  commit action raises an exception, commit actions that have already been
+  executed are not rolled back.
+
 - Added AI best-practices guidance for using pyparsing to implement parsers.
   The guidance is stored in ``pyparsing/ai/best_practices.md`` and can be accessed
   programmatically via ``pyparsing.show_best_practices()`` or from the command line

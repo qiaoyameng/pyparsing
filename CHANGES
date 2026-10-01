@@ -27,6 +27,15 @@ Required Python versions by pyparsing version
 
 Version 3.3.3 - in development
 ------------------------------
+- Added deferred commit actions, defined using
+  `ParserElement.set_commit_action()` and `ParserElement.add_commit_action()`.
+  Commit actions use the same call signatures as parse actions, but are only
+  executed after the complete parse succeeds (including any `parse_all=True`
+  check). Commit actions registered by parse branches that later fail are
+  discarded, and packrat cache hits do not cause duplicate executions. If a
+  commit action raises an exception, commit actions that have already been
+  executed are not rolled back.
+
 - Added support for Python 3.15.
 
 - Parse actions that return a tuple value for a named expression formerly saved

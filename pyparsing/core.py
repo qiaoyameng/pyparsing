@@ -502,6 +502,7 @@ class ParserElement(ABC):
 
     def __init__(self, savelist: bool = False) -> None:
         self.parseAction: list[ParseAction] = list()
+        self.commitAction: list[ParseAction] = list()
         self.failAction: typing.Optional[ParseFailAction] = None
         self.customName: str = None  # type: ignore[assignment]
         self._defaultName: typing.Optional[str] = None
@@ -621,6 +622,7 @@ class ParserElement(ABC):
         """
         cpy = copy.copy(self)
         cpy.parseAction = self.parseAction[:]
+        cpy.commitAction = self.commitAction[:]
         cpy.ignoreExprs = self.ignoreExprs[:]
         if self.copyDefaultWhiteChars:
             cpy.whiteChars = set(ParserElement.DEFAULT_WHITE_CHARS)
@@ -869,6 +871,104 @@ class ParserElement(ABC):
         self.callDuringTry = self.callDuringTry or call_during_try or callDuringTry
         return self
 
+    def set_commit_action(self, *fns: ParseAction) -> ParserElement:
+        """
+        Define one or more commit actions for this parse element.
+
+        Commit actions use the same callable signatures as parse actions (see
+        :class:`set_parse_action`): ``fn(s, loc, toks)``, ``fn(loc, toks)``,
+        ``fn(toks)``, or just ``fn()``. Unlike parse actions, commit actions are
+        *not* executed when their expression matches. Instead, they are registered
+        in a journal while parsing, and are only executed after the complete parse
+        has succeeded, including any ``parse_all=True`` end-of-input check.
+
+        Commit actions are intended for side effects that must only happen once
+        the parse is known to have succeeded, such as registering symbols in an
+        external symbol table, emitting output, or updating files or databases.
+
+        Behavioral notes:
+
+        - commit actions registered by a parse branch that later fails are
+          discarded - this includes losing alternatives of :class:`MatchFirst`,
+          :class:`Or`, :class:`Optional`, and repetitions, as well as successful
+          matches whose enclosing expression fails afterwards;
+        - commit actions are executed in the order they were registered;
+        - packrat cache hits replay the registered commit actions of the cached
+          match, so each registered commit action is executed exactly once per
+          parse - cache hits never cause duplicate executions;
+        - commit actions are not run during lookahead or ``try_parse`` probes
+          (parses with ``do_actions=False``), and do not participate in
+          ``call_during_try``;
+        - return values of commit actions are ignored, since the parsed results
+          are already final by the time commit actions run;
+        - commit actions are executed by :class:`parse_string` (after the
+          ``parse_all`` check, if any) and by :class:`scan_string` (after each
+          match).
+
+        .. Note::
+           If a commit action raises an exception, the exception propagates to
+           the caller of ``parse_string``/``scan_string``. Commit actions that
+           have already been executed are *not* rolled back - pyparsing cannot
+           automatically undo arbitrary side effects.
+
+        If ``None`` is passed as the ``fn`` commit action, all previously added
+        commit actions for this expression are cleared.
+
+        Example:
+
+        .. testcode::
+
+            symbol_table = []
+
+            def register_symbol(toks):
+                symbol_table.append(toks[0])
+
+            definition = Word(alphas).add_commit_action(register_symbol)
+            parser = definition + ";" + Word(alphas) | definition + ";"
+
+            # the first alternative registers "x" and then fails, so its
+            # commit action is discarded; only the successful alternative's
+            # commit action is executed
+            parser.parse_string("x;")
+            print(symbol_table)
+
+            # a failed parse executes no commit actions at all
+            del symbol_table[:]
+            try:
+                parser.parse_string("x; y z", parse_all=True)
+            except ParseException:
+                print("parse failed, symbol_table:", symbol_table)
+
+        prints:
+
+        .. testoutput::
+
+            ['x']
+            parse failed, symbol_table: []
+
+        .. versionadded:: 3.3.3
+        """
+        if list(fns) == [None]:
+            self.commitAction.clear()
+            return self
+
+        if not all(callable(fn) for fn in fns):
+            raise TypeError("commit actions must be callable")
+        self.commitAction[:] = [_trim_arity(fn) for fn in fns]
+        return self
+
+    def add_commit_action(self, *fns: ParseAction) -> ParserElement:
+        """
+        Add one or more commit actions to this expression's list of commit
+        actions. See :class:`set_commit_action`.
+
+        .. versionadded:: 3.3.3
+        """
+        if not all(callable(fn) for fn in fns):
+            raise TypeError("commit actions must be callable")
+        self.commitAction += [_trim_arity(fn) for fn in fns]
+        return self
+
     def set_fail_action(self, fn: ParseFailAction) -> ParserElement:
         """
         Define action to perform if parsing fails at this expression.
@@ -928,19 +1028,49 @@ class ParserElement(ABC):
     def _parseNoCache(
         self, instring, loc, do_actions=True, callPreParse=True
     ) -> tuple[int, ParseResults]:
-        debugging = self.debug  # and do_actions)
-        len_instring = len(instring)
+        # the journal length is recorded so that any commit actions registered
+        # by this expression (and its sub-expressions) can be discarded if this
+        # parse branch fails
+        commit_journal = ParserElement._commit_journal
+        commit_journal_len = len(commit_journal) if commit_journal is not None else 0
+        try:
+            debugging = self.debug  # and do_actions)
+            len_instring = len(instring)
 
-        if debugging or self.failAction:
-            # print("Match {} at loc {}({}, {})".format(self, loc, lineno(loc, instring), col(loc, instring)))
-            try:
+            if debugging or self.failAction:
+                # print("Match {} at loc {}({}, {})".format(self, loc, lineno(loc, instring), col(loc, instring)))
+                try:
+                    if callPreParse and self.callPreparse:
+                        pre_loc = self.preParse(instring, loc)
+                    else:
+                        pre_loc = loc
+                    tokens_start = pre_loc
+                    if self.debugActions.debug_try:
+                        self.debugActions.debug_try(instring, tokens_start, self, False)
+                    if self.mayIndexError or pre_loc >= len_instring:
+                        try:
+                            loc, tokens = self.parseImpl(instring, pre_loc, do_actions)
+                        except IndexError:
+                            raise ParseException(
+                                instring, len_instring, self.errmsg, self
+                            )
+                    else:
+                        loc, tokens = self.parseImpl(instring, pre_loc, do_actions)
+                except Exception as err:
+                    # print("Exception raised:", err)
+                    if self.debugActions.debug_fail:
+                        self.debugActions.debug_fail(
+                            instring, tokens_start, self, err, False
+                        )
+                    if self.failAction:
+                        self.failAction(instring, tokens_start, self, err)
+                    raise
+            else:
                 if callPreParse and self.callPreparse:
                     pre_loc = self.preParse(instring, loc)
                 else:
                     pre_loc = loc
                 tokens_start = pre_loc
-                if self.debugActions.debug_try:
-                    self.debugActions.debug_try(instring, tokens_start, self, False)
                 if self.mayIndexError or pre_loc >= len_instring:
                     try:
                         loc, tokens = self.parseImpl(instring, pre_loc, do_actions)
@@ -948,37 +1078,46 @@ class ParserElement(ABC):
                         raise ParseException(instring, len_instring, self.errmsg, self)
                 else:
                     loc, tokens = self.parseImpl(instring, pre_loc, do_actions)
-            except Exception as err:
-                # print("Exception raised:", err)
-                if self.debugActions.debug_fail:
-                    self.debugActions.debug_fail(
-                        instring, tokens_start, self, err, False
-                    )
-                if self.failAction:
-                    self.failAction(instring, tokens_start, self, err)
-                raise
-        else:
-            if callPreParse and self.callPreparse:
-                pre_loc = self.preParse(instring, loc)
-            else:
-                pre_loc = loc
-            tokens_start = pre_loc
-            if self.mayIndexError or pre_loc >= len_instring:
-                try:
-                    loc, tokens = self.parseImpl(instring, pre_loc, do_actions)
-                except IndexError:
-                    raise ParseException(instring, len_instring, self.errmsg, self)
-            else:
-                loc, tokens = self.parseImpl(instring, pre_loc, do_actions)
 
-        tokens = self.postParse(instring, loc, tokens)
+            tokens = self.postParse(instring, loc, tokens)
 
-        ret_tokens = ParseResults(
-            tokens, self.resultsName, aslist=self.saveAsList, modal=self.modalResults
-        )
-        if self.parseAction and (do_actions or self.callDuringTry):
-            if debugging:
-                try:
+            ret_tokens = ParseResults(
+                tokens, self.resultsName, aslist=self.saveAsList, modal=self.modalResults
+            )
+            if self.parseAction and (do_actions or self.callDuringTry):
+                if debugging:
+                    try:
+                        for fn in self.parseAction:
+                            try:
+                                tokens = fn(instring, tokens_start, ret_tokens)  # type: ignore [call-arg, arg-type]
+                            except IndexError as parse_action_exc:
+                                exc = ParseException("exception raised in parse action")
+                                raise exc from parse_action_exc
+
+                            if tokens is not None and tokens is not ret_tokens:
+                                if isinstance(tokens, (ParseResults, list)) or tokens == ():
+                                    ret_tokens = ParseResults(
+                                        tokens,
+                                        self.resultsName,
+                                        aslist=self.saveAsList
+                                        and isinstance(tokens, (ParseResults, list)),
+                                        modal=self.modalResults,
+                                    )
+                                else:
+                                    ret_tokens = ParseResults(
+                                        [tokens],
+                                        self.resultsName,
+                                        aslist=False,
+                                        modal=self.modalResults,
+                                    )
+                    except Exception as err:
+                        # print "Exception raised in user parse action:", err
+                        if self.debugActions.debug_fail:
+                            self.debugActions.debug_fail(
+                                instring, tokens_start, self, err, False
+                            )
+                        raise
+                else:
                     for fn in self.parseAction:
                         try:
                             tokens = fn(instring, tokens_start, ret_tokens)  # type: ignore [call-arg, arg-type]
@@ -1002,45 +1141,26 @@ class ParserElement(ABC):
                                     aslist=False,
                                     modal=self.modalResults,
                                 )
-                except Exception as err:
-                    # print "Exception raised in user parse action:", err
-                    if self.debugActions.debug_fail:
-                        self.debugActions.debug_fail(
-                            instring, tokens_start, self, err, False
-                        )
-                    raise
-            else:
-                for fn in self.parseAction:
-                    try:
-                        tokens = fn(instring, tokens_start, ret_tokens)  # type: ignore [call-arg, arg-type]
-                    except IndexError as parse_action_exc:
-                        exc = ParseException("exception raised in parse action")
-                        raise exc from parse_action_exc
+            if self.commitAction and do_actions:
+                # defer commit actions - they are only executed once the
+                # complete parse has succeeded (see parse_string/scan_string)
+                if commit_journal is not None:
+                    for fn in self.commitAction:
+                        commit_journal.append((fn, instring, tokens_start, ret_tokens))
+            if debugging:
+                # print("Matched", self, "->", ret_tokens.as_list())
+                if self.debugActions.debug_match:
+                    self.debugActions.debug_match(
+                        instring, tokens_start, loc, self, ret_tokens, False
+                    )
 
-                    if tokens is not None and tokens is not ret_tokens:
-                        if isinstance(tokens, (ParseResults, list)) or tokens == ():
-                            ret_tokens = ParseResults(
-                                tokens,
-                                self.resultsName,
-                                aslist=self.saveAsList
-                                and isinstance(tokens, (ParseResults, list)),
-                                modal=self.modalResults,
-                            )
-                        else:
-                            ret_tokens = ParseResults(
-                                [tokens],
-                                self.resultsName,
-                                aslist=False,
-                                modal=self.modalResults,
-                            )
-        if debugging:
-            # print("Matched", self, "->", ret_tokens.as_list())
-            if self.debugActions.debug_match:
-                self.debugActions.debug_match(
-                    instring, tokens_start, loc, self, ret_tokens, False
-                )
-
-        return loc, ret_tokens
+            return loc, ret_tokens
+        except BaseException:
+            # this parse branch failed - discard any commit actions registered
+            # by this expression and its sub-expressions
+            if commit_journal is not None:
+                del commit_journal[commit_journal_len:]
+            raise
 
     def try_parse(
         self,
@@ -1068,8 +1188,33 @@ class ParserElement(ABC):
     # cache for left-recursion in Forward references
     recursion_lock = RLock()
     recursion_memos: collections.abc.MutableMapping[
-        tuple[int, Forward, bool], tuple[int, Union[ParseResults, Exception]]
+        tuple[int, Forward, bool],
+        tuple[int, Union[ParseResults, Exception], tuple],
     ] = {}
+
+    # journal of commit actions registered during the current
+    # parse_string/scan_string call; commit actions are only executed after
+    # the overall parse succeeds, and entries registered by parse branches
+    # that later fail are discarded from the journal
+    _commit_journal: typing.Optional[
+        list[tuple[ParseAction, str, int, ParseResults]]
+    ] = None
+
+    @staticmethod
+    def _run_commit_actions(
+        journal: list[tuple[ParseAction, str, int, ParseResults]],
+    ) -> None:
+        # execute the commit actions registered during a successful parse;
+        # packrat cache hits may replay the same journal entry more than
+        # once, so deduplicate by entry identity to ensure each registered
+        # commit action is executed exactly once
+        seen_ids: set[int] = set()
+        for entry in journal:
+            if id(entry) in seen_ids:
+                continue
+            seen_ids.add(id(entry))
+            fn, s, loc, toks = entry
+            fn(s, loc, toks)
 
     class _CacheType(typing.Protocol):
         """
@@ -1118,6 +1263,10 @@ class ParserElement(ABC):
             value = cache.get(lookup)
             if value is cache.not_in_cache:
                 ParserElement.packrat_cache_stats[MISS] += 1
+                commit_journal = ParserElement._commit_journal
+                commit_journal_len = (
+                    len(commit_journal) if commit_journal is not None else 0
+                )
                 try:
                     value = self._parseNoCache(instring, loc, do_actions, callPreParse)
                 except ParseBaseException as pe:
@@ -1125,7 +1274,14 @@ class ParserElement(ABC):
                     cache.set(lookup, pe.__class__(*pe.args))
                     raise
                 else:
-                    cache.set(lookup, (value[0], value[1].copy(), loc))
+                    # cache any commit actions registered by this match, so
+                    # that cache hits can replay them into the current journal
+                    commit_entries = (
+                        tuple(commit_journal[commit_journal_len:])
+                        if commit_journal is not None
+                        else ()
+                    )
+                    cache.set(lookup, (value[0], value[1].copy(), loc, commit_entries))
                     return value
             else:
                 ParserElement.packrat_cache_stats[HIT] += 1
@@ -1144,8 +1300,24 @@ class ParserElement(ABC):
                             pass
                     raise value
 
-                value = cast(tuple[int, ParseResults, int], value)
+                value = cast(
+                    tuple[
+                        int,
+                        ParseResults,
+                        int,
+                        tuple[tuple[ParseAction, str, int, ParseResults], ...],
+                    ],
+                    value,
+                )
                 loc_, result, endloc = value[0], value[1].copy(), value[2]
+                if len(value) > 3 and value[3]:
+                    # replay commit actions registered by the cached match, so
+                    # that they are properly attributed to the current parse
+                    # branch (they are executed at most once - see
+                    # _run_commit_actions)
+                    commit_journal = ParserElement._commit_journal
+                    if commit_journal is not None:
+                        commit_journal.extend(value[3])
                 if self.debug and self.debugActions.debug_match:
                     try:
                         self.debugActions.debug_match(
@@ -1358,22 +1530,30 @@ class ParserElement(ABC):
             e.streamline()
         if not self.keepTabs:
             instring = instring.expandtabs()
+        prev_commit_journal = ParserElement._commit_journal
+        commit_journal: list[tuple[ParseAction, str, int, ParseResults]] = []
+        ParserElement._commit_journal = commit_journal
         try:
-            loc, tokens = self._parse(instring, 0)
-            if parse_all:
-                loc = self.preParse(instring, loc)
-                se = Empty() + StringEnd().set_debug(False)
-                se._parse(instring, loc)
-        except _ParseActionIndexError as pa_exc:
-            raise pa_exc.exc
-        except ParseBaseException as exc:
-            if ParserElement.verbose_stacktrace:
-                raise
+            try:
+                loc, tokens = self._parse(instring, 0)
+                if parse_all:
+                    loc = self.preParse(instring, loc)
+                    se = Empty() + StringEnd().set_debug(False)
+                    se._parse(instring, loc)
+            except _ParseActionIndexError as pa_exc:
+                raise pa_exc.exc
+            except ParseBaseException as exc:
+                if ParserElement.verbose_stacktrace:
+                    raise
 
-            # catch and re-raise exception from here, clearing out pyparsing internal stack trace
-            raise exc.with_traceback(None)
-        else:
-            return tokens
+                # catch and re-raise exception from here, clearing out pyparsing internal stack trace
+                raise exc.with_traceback(None)
+        finally:
+            ParserElement._commit_journal = prev_commit_journal
+        # the parse (including any parse_all check) succeeded - run the
+        # deferred commit actions registered during the parse
+        ParserElement._run_commit_actions(commit_journal)
+        return tokens
 
     def scan_string(
         self,
@@ -1438,11 +1618,14 @@ class ParserElement(ABC):
             preparseFn = preparser.preParse
         else:
             preparseFn = self.preParse
+        prev_commit_journal = ParserElement._commit_journal
         parseFn = self._parse
         ParserElement.reset_cache()
         matches = 0
         try:
             while loc <= instrlen and matches < max_matches:
+                commit_journal: list[tuple[ParseAction, str, int, ParseResults]] = []
+                ParserElement._commit_journal = commit_journal
                 try:
                     preloc: int = preparseFn(instring, loc)
                     nextLoc: int
@@ -1453,6 +1636,8 @@ class ParserElement(ABC):
                 else:
                     if nextLoc > loc:
                         matches += 1
+                        # this match succeeded - run its deferred commit actions
+                        ParserElement._run_commit_actions(commit_journal)
                         if debug:
                             print(
                                 {
@@ -1478,6 +1663,8 @@ class ParserElement(ABC):
 
             # catch and re-raise exception from here, clears out pyparsing internal stack trace
             raise exc.with_traceback(None)
+        finally:
+            ParserElement._commit_journal = prev_commit_journal
 
     def transform_string(self, instring: str, *, debug: bool = False) -> str:
         """
@@ -6327,23 +6514,35 @@ class Forward(ParseElementEnhance):
             memo = ParserElement.recursion_memos
             try:
                 # we are parsing at a specific recursion expansion - use it as-is
-                prev_loc, prev_result = memo[loc, self, do_actions]
+                prev_loc, prev_result, prev_entries = memo[loc, self, do_actions]
                 if isinstance(prev_result, Exception):
                     raise prev_result
+                if do_actions and prev_entries:
+                    # replay commit actions registered by the memoized match
+                    commit_journal = ParserElement._commit_journal
+                    if commit_journal is not None:
+                        commit_journal.extend(prev_entries)
                 return prev_loc, prev_result.copy()
             except KeyError:
                 act_key = (loc, self, True)
                 peek_key = (loc, self, False)
                 # we are searching for the best recursion expansion - keep on improving
                 # both `do_actions` cases must be tracked separately here!
-                prev_loc, prev_peek = memo[peek_key] = (
+                # (memo values are (loc, result, registered commit actions))
+                memo[peek_key] = (
                     loc - 1,
                     ParseException(
                         instring, loc, "Forward recursion without base case", self
                     ),
+                    (),
                 )
+                prev_loc, prev_peek = memo[peek_key][0], memo[peek_key][1]
                 if do_actions:
                     memo[act_key] = memo[peek_key]
+                commit_journal = ParserElement._commit_journal
+                commit_journal_len = (
+                    len(commit_journal) if commit_journal is not None else 0
+                )
                 while True:
                     try:
                         new_loc, new_peek = super().parseImpl(instring, loc, False)
@@ -6357,19 +6556,31 @@ class Forward(ParseElementEnhance):
                         if do_actions:
                             # replace the match for do_actions=False as well,
                             # in case the action did backtrack
-                            prev_loc, prev_result = memo[peek_key] = memo[act_key]
+                            memo[peek_key] = memo[act_key]
+                            prev_loc, prev_result = memo[act_key][0], memo[act_key][1]
                             del memo[peek_key], memo[act_key]
                             return prev_loc, copy.copy(prev_result)
                         del memo[peek_key]
                         return prev_loc, copy.copy(prev_peek)
                     # the match did get better: see if we can improve further
                     if do_actions:
+                        # discard commit actions registered by the superseded
+                        # recursion attempt before trying a deeper expansion
+                        if commit_journal is not None:
+                            del commit_journal[commit_journal_len:]
                         try:
-                            memo[act_key] = super().parseImpl(instring, loc, True)
+                            act_loc, act_result = super().parseImpl(instring, loc, True)
                         except ParseException as e:
-                            memo[peek_key] = memo[act_key] = (new_loc, e)
+                            memo[peek_key] = memo[act_key] = (new_loc, e, ())
                             raise
-                    prev_loc, prev_peek = memo[peek_key] = new_loc, new_peek
+                        act_entries = (
+                            tuple(commit_journal[commit_journal_len:])
+                            if commit_journal is not None
+                            else ()
+                        )
+                        memo[act_key] = (act_loc, act_result, act_entries)
+                    prev_loc, prev_peek = new_loc, new_peek
+                    memo[peek_key] = (new_loc, new_peek, ())
 
     def leave_whitespace(self, recursive: bool = True) -> ParserElement:
         """
