@@ -9,6 +9,7 @@
 import collections
 import contextlib
 import datetime
+import hashlib
 import random
 import re
 import shlex
@@ -291,6 +292,81 @@ class Test02_WithoutPackrat(ppt.TestParseResultsAsserts, TestCase):
             "I 12,345 Acme Industries asagifttomyexwife",
             out_string,
             msg="failure in transform_string",
+        )
+
+    def testPlanPatchesSelectsPartialMatchesWithTabsUnicodeAndCRLF(self):
+        parser = pp.Regex(r"\w+").set_parse_action(lambda t: f"[{t[0].upper()}]")
+        parser.ignore(pp.python_style_comment)
+        text = "a\tb 値\r\n# ignore c\r\nc d\r\n"
+
+        plan = parser.plan_patches(text)
+
+        self.assertEqual(
+            [
+                pp.Patch(0, 1, "a", "[A]"),
+                pp.Patch(2, 3, "b", "[B]"),
+                pp.Patch(4, 5, "値", "[値]"),
+                pp.Patch(19, 20, "c", "[C]"),
+                pp.Patch(21, 22, "d", "[D]"),
+            ],
+            list(plan.patches),
+        )
+        self.assertEqual(
+            hashlib.sha256(text.encode("utf-8")).hexdigest(), plan.source_digest
+        )
+
+        self.assertEqual(text, plan.apply(text, []))
+        self.assertEqual(
+            "a\t[B] 値\r\n# ignore c\r\nc [D]\r\n",
+            plan.apply(text, [plan.patches[1], plan.patches[4]]),
+        )
+
+    def testPlanPatchesRejectsOverlapsAndForeignSources(self):
+        parser = pp.Regex("abc|b").set_parse_action(lambda: "X")
+
+        self.assertEqual(
+            [[0, 3]],
+            [[p.start, p.end] for p in parser.plan_patches("abc").patches],
+        )
+
+        plan = parser.plan_patches("abc", overlap=True)
+        self.assertEqual(
+            [pp.Patch(0, 3, "abc", "X"), pp.Patch(1, 2, "b", "X")],
+            list(plan.patches),
+        )
+
+        with self.assertRaises(ValueError):
+            plan.apply("abc", list(plan.patches))
+        self.assertEqual("X", plan.apply("abc", [plan.patches[0]]))
+        self.assertEqual("aXc", plan.apply("abc", [plan.patches[1]]))
+
+        other_patch = pp.Patch(0, 1, "a", "x")
+        with self.assertRaises(ValueError):
+            plan.apply("abc", [other_patch])
+        with self.assertRaises(ValueError):
+            plan.apply("abcd", [])
+
+    def testPlanPatchesPreservesIgnoredCommentsAndCRLFInsideMatches(self):
+        value = pp.Regex(r"\w+").set_parse_action(lambda t: f"<{t[0].upper()}>")
+        parser = (pp.Suppress("key") + value).ignore(pp.python_style_comment)
+        text = "key # keep\r\nvalue\r\nkey other\r\n"
+
+        plan = parser.plan_patches(text)
+
+        self.assertEqual(
+            [
+                pp.Patch(0, 17, "key # keep\r\nvalue", " # keep\r\n<VALUE>"),
+                pp.Patch(19, 28, "key other", " <OTHER>"),
+            ],
+            list(plan.patches),
+        )
+        self.assertEqual(
+            " # keep\r\n<VALUE>\r\n <OTHER>\r\n",
+            plan.apply(text),
+        )
+        self.assertEqual(
+            "key # keep\r\nvalue\r\n <OTHER>\r\n",
+            plan.apply(text, [plan.patches[1]]),
         )
 
     def testTransformStringWithLeadingWhitespace(self):

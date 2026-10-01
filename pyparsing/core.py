@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import collections.abc
 from collections import deque
+import hashlib
 import os
 import typing
 from typing import (
@@ -404,6 +405,332 @@ def _default_exception_debug_action(
 
 def null_debug_action(*args):
     """'Do-nothing' debug action, to suppress debugging output during parsing."""
+
+
+class Patch(NamedTuple):
+    """A proposed replacement for one matched interval."""
+
+    start: int
+    end: int
+    original: str
+    replacement: str
+
+
+class PatchPlan:
+    """Reviewable text replacements from :meth:`ParserElement.plan_patches`."""
+
+    def __init__(
+        self, patches: typing.Sequence[Patch], source_digest: str
+    ) -> None:
+        self.patches: tuple[Patch, ...] = tuple(patches)
+        self.source_digest = source_digest
+
+    def apply(
+        self,
+        instring: str,
+        patches: typing.Optional[typing.Union[Patch, typing.Sequence[Patch]]] = None,
+    ) -> str:
+        """Apply selected patches to ``instring``.
+
+        With no patch argument, all patches in the plan are applied. Passing an
+        empty sequence applies none and returns the original text unchanged.
+        Patches must not overlap, and ``instring`` must have the same SHA-256
+        digest as the text used to create the plan.
+        """
+        if self._digest(instring) != self.source_digest:
+            raise ValueError("patch plan was created for a different source string")
+
+        if patches is None:
+            selected = self.patches
+        elif isinstance(patches, Patch):
+            selected = (patches,)
+        else:
+            selected = tuple(patches)
+
+        planned_patches = set(self.patches)
+        for patch in selected:
+            if patch not in planned_patches:
+                raise ValueError("patch is not part of this patch plan")
+            if not (0 <= patch.start <= patch.end <= len(instring)):
+                raise ValueError(f"invalid patch interval: {patch.start}:{patch.end}")
+            if instring[patch.start : patch.end] != patch.original:
+                raise ValueError("patch source no longer matches the source string")
+
+        ordered = sorted(selected, key=lambda patch: (patch.start, patch.end))
+        for previous, current in zip(ordered, ordered[1:]):
+            if previous.end > current.start:
+                raise ValueError(
+                    "overlapping patches are not supported; "
+                    "select non-overlapping patches"
+                )
+
+        out: list[str] = []
+        last_end = 0
+        for patch in ordered:
+            out.append(instring[last_end : patch.start])
+            out.append(patch.replacement)
+            last_end = patch.end
+        out.append(instring[last_end:])
+        return "".join(out)
+
+    @staticmethod
+    def _digest(instring: str) -> str:
+        return hashlib.sha256(instring.encode("utf-8")).hexdigest()
+
+
+def _expandtabs_mapping(
+    instring: str, tabsize: int = 8
+) -> tuple[list[int], list[int]]:
+    """Return maps between original and ``str.expandtabs`` character locations."""
+    original_to_expanded = []
+    expanded_to_original = []
+    expanded_loc = 0
+    column = 0
+    for original_loc, char in enumerate(instring):
+        original_to_expanded.append(expanded_loc)
+        if char == "\t":
+            spaces = tabsize - column % tabsize
+            expanded_to_original.extend([original_loc] * spaces)
+            expanded_loc += spaces
+            column += spaces
+        else:
+            expanded_to_original.append(original_loc)
+            expanded_loc += 1
+            if char in "\r\n":
+                column = 0
+            else:
+                column += 1
+    original_to_expanded.append(expanded_loc)
+    return original_to_expanded, expanded_to_original
+
+
+def _map_expanded_location(
+    loc: int,
+    instring: str,
+    original_to_expanded: typing.Sequence[int],
+    expanded_to_original: typing.Sequence[int],
+    *,
+    is_end: bool = False,
+) -> int:
+    if loc == len(expanded_to_original):
+        return len(instring)
+    original_loc = expanded_to_original[loc]
+    if (
+        is_end
+        and instring[original_loc] == "\t"
+        and loc > original_to_expanded[original_loc]
+    ):
+        return original_loc + 1
+    return original_loc
+
+
+def _replacement_values(tokens: Any) -> list[str]:
+    if isinstance(tokens, ParseResults):
+        values = _flatten(tokens.as_list())
+    elif isinstance(tokens, Iterable) and not isinstance(tokens, str_type):
+        values = _flatten(list(tokens))
+    else:
+        values = [tokens]
+    return ["" if value is None else str(value) for value in values]
+
+
+def _replacement_preserving_gaps(
+    tokens: Any,
+    instring: str,
+    start: int,
+    end: int,
+    token_spans: typing.Sequence[tuple[int, int, int]],
+) -> str:
+    values = _replacement_values(tokens)
+    if not token_spans:
+        return "".join(values)
+
+    ordered_spans = sorted(set(token_spans))
+    pieces: list[str] = []
+    cursor = start
+    value_index = 0
+    visible_span_count = sum(span[2] == 1 for span in ordered_spans)
+    if visible_span_count != len(values):
+        return "".join(values)
+
+    for token_start, token_end, span_kind in ordered_spans:
+        if token_start < cursor:
+            continue
+        pieces.append(instring[cursor:token_start])
+        if span_kind == 1:
+            pieces.append(values[value_index])
+            value_index += 1
+        cursor = token_end
+
+    pieces.append(instring[cursor:end])
+    return "".join(pieces)
+
+
+def _scan_with_token_spans(
+    parser: ParserElement,
+    instring: str,
+    max_matches: int,
+    overlap: bool,
+    always_skip_whitespace: bool,
+    debug: bool,
+) -> list[tuple[ParseResults, int, int, list[tuple[int, int, int]]]]:
+    try:
+        raw_parser = copy.deepcopy(parser)
+    except Exception:
+        return [
+            (tokens, start, end, [])
+            for tokens, start, end in parser.scan_string(
+                instring,
+                max_matches=max_matches,
+                overlap=overlap,
+                always_skip_whitespace=always_skip_whitespace,
+                debug=debug,
+            )
+        ]
+    raw_parser.disable_memoization()
+
+    main_elements = list(raw_parser.visit_all())
+    all_elements: set[ParserElement] = set(main_elements)
+    for element in main_elements:
+        element.parseAction.clear()
+        pending_ignored = deque(element.ignoreExprs)
+        while pending_ignored:
+            ignored = pending_ignored.popleft()
+            if ignored in all_elements:
+                continue
+            all_elements.add(ignored)
+            ignored.parseAction.clear()
+            pending_ignored.extend(ignored.ignoreExprs)
+
+    match_spans: list[tuple[int, int, int]] = []
+    active_context: list[typing.Literal["suppressed", "ignored"]] = []
+    all_ignored_roots = tuple(all_elements.difference(main_elements))
+    ignored_roots_set = set(all_ignored_roots)
+
+    def wrap_parse(element: ParserElement, original) -> Callable:
+        is_context_element = isinstance(element, Suppress) or element in ignored_roots_set
+        context = "suppressed" if isinstance(element, Suppress) else "ignored"
+
+        def parse(
+            string: str,
+            loc: int,
+            do_actions: bool = True,
+            call_pre_parse: bool = True,
+            *,
+            is_context_element=is_context_element,
+            callPreParse: typing.Optional[bool] = None,
+        ):
+            if callPreParse is not None:
+                call_pre_parse = callPreParse
+            checkpoint = len(match_spans)
+            if is_context_element:
+                active_context.append(context)
+            try:
+                return original(string, loc, do_actions, call_pre_parse)
+            except Exception:
+                del match_spans[checkpoint:]
+                raise
+            finally:
+                if is_context_element:
+                    active_context.pop()
+
+        return parse
+
+    for element in main_elements:
+        element._parse = wrap_parse(element, element._parse)  # type: ignore[method-assign]
+        if isinstance(element, Token):
+            original_parse_impl = element.parseImpl
+
+            def parse_impl(
+                string: str,
+                loc: int,
+                do_actions: bool = True,
+                *,
+                original=original_parse_impl,
+                callPreParse: typing.Optional[bool] = None,
+                **kwargs: Any,
+            ):
+                end, tokens = original(string, loc, do_actions)
+                if end > loc and (
+                    not active_context or active_context[-1] == "suppressed"
+                ):
+                    match_spans.append((loc, end, 0 if active_context else 1))
+                return end, tokens
+
+            element.parseImpl = parse_impl  # type: ignore[method-assign]
+
+    for element in all_ignored_roots:
+        element._parse = wrap_parse(element, element._parse)  # type: ignore[method-assign]
+        if isinstance(element, Token):
+            original_parse_impl = element.parseImpl
+
+            def ignored_parse_impl(
+                string: str,
+                loc: int,
+                do_actions: bool = True,
+                *,
+                original=original_parse_impl,
+                callPreParse: typing.Optional[bool] = None,
+            ):
+                active_context.append("ignored")
+                try:
+                    return original(string, loc, do_actions)
+                finally:
+                    active_context.pop()
+
+            element.parseImpl = ignored_parse_impl  # type: ignore[method-assign]
+
+    raw_matches: list[tuple[ParseResults, int, int]] = []
+    raw_span_sets: list[list[tuple[int, int, int]]] = []
+    for raw_match in raw_parser.scan_string(
+        instring,
+        max_matches=max_matches,
+        overlap=overlap,
+        always_skip_whitespace=always_skip_whitespace,
+        debug=False,
+    ):
+        raw_matches.append(raw_match)
+        raw_span_sets.append(list(match_spans))
+        match_spans.clear()
+
+    transformed_matches = list(
+        parser.scan_string(
+            instring,
+            max_matches=max_matches,
+            overlap=overlap,
+            always_skip_whitespace=always_skip_whitespace,
+            debug=debug,
+        )
+    )
+
+    if len(raw_matches) != len(transformed_matches):
+        raise ParseSyntaxException(
+            instring, 0, "unable to map token spans for patch planning"
+        )
+
+    mapped_matches: list[
+        tuple[ParseResults, int, int, list[tuple[int, int, int]]]
+    ] = []
+    for raw_match, transformed_match, token_spans in zip(
+        raw_matches, transformed_matches, raw_span_sets
+    ):
+        _, raw_start, raw_end = raw_match
+        transformed_tokens, transformed_start, transformed_end = transformed_match
+        if (raw_start, raw_end) != (transformed_start, transformed_end):
+            raise ParseSyntaxException(
+                instring,
+                transformed_start,
+                "unable to map token spans for patch planning",
+            )
+        mapped_matches.append(
+            (
+                transformed_tokens,
+                transformed_start,
+                transformed_end,
+                token_spans,
+            )
+        )
+    return mapped_matches
 
 
 class ParserElement(ABC):
@@ -1538,6 +1865,108 @@ class ParserElement(ABC):
             # catch and re-raise exception from here, clears out pyparsing internal stack trace
             raise exc.with_traceback(None)
 
+    def plan_patches(
+        self,
+        instring: str,
+        max_matches: int = _MAX_INT,
+        overlap: bool = False,
+        always_skip_whitespace: bool = True,
+        *,
+        debug: bool = False,
+        **kwargs: Any,
+    ) -> PatchPlan:
+        """
+        Scan for matches and return a reviewable :class:`PatchPlan`.
+
+        Unlike :meth:`transform_string`, this does not modify the source string.
+        Each :class:`Patch` contains the original interval, original text, and the
+        replacement produced by attached parse actions. The caller may apply all,
+        some, or none of the patches through :meth:`PatchPlan.apply`.
+
+        Tabs are expanded using pyparsing's normal scan semantics, while patch
+        intervals are mapped back to ``instring``. Unselected text, including
+        ignored comments and CRLF outside selected intervals, is preserved.
+        """
+        maxMatches: int = deprecate_argument(kwargs, "maxMatches", _MAX_INT)
+        max_matches = min(maxMatches, max_matches)
+
+        scanned_string = instring
+        if not self.keepTabs:
+            scanned_string = instring.expandtabs()
+            original_to_expanded, expanded_to_original = _expandtabs_mapping(instring)
+
+        patches: list[Patch] = []
+        try:
+            for tokens, start, end, token_spans in _scan_with_token_spans(
+                self,
+                scanned_string,
+                max_matches=max_matches,
+                overlap=overlap,
+                always_skip_whitespace=always_skip_whitespace,
+                debug=debug,
+            ):
+                if not self.keepTabs:
+                    original_start = _map_expanded_location(
+                        start,
+                        instring,
+                        original_to_expanded,
+                        expanded_to_original,
+                    )
+                    original_end = _map_expanded_location(
+                        end,
+                        instring,
+                        original_to_expanded,
+                        expanded_to_original,
+                        is_end=True,
+                    )
+                else:
+                    original_start, original_end = start, end
+
+                original_token_spans: list[tuple[int, int, int]] = []
+                for token_start, token_end, span_kind in token_spans:
+                    original_token_start = token_start if self.keepTabs else (
+                        _map_expanded_location(
+                            token_start,
+                            instring,
+                            original_to_expanded,
+                            expanded_to_original,
+                        )
+                    )
+                    original_token_end = token_end if self.keepTabs else (
+                        _map_expanded_location(
+                            token_end,
+                            instring,
+                            original_to_expanded,
+                            expanded_to_original,
+                            is_end=True,
+                        )
+                    )
+                    original_token_spans.append(
+                        (original_token_start, original_token_end, span_kind)
+                    )
+
+                patches.append(
+                    Patch(
+                        original_start,
+                        original_end,
+                        instring[original_start:original_end],
+                        _replacement_preserving_gaps(
+                            tokens,
+                            instring,
+                            original_start,
+                            original_end,
+                            original_token_spans,
+                        ),
+                    )
+                )
+        except ParseBaseException as exc:
+            if ParserElement.verbose_stacktrace:
+                raise
+
+            raise exc.with_traceback(None)
+
+        return PatchPlan(patches, PatchPlan._digest(instring))
+
     def search_string(
         self,
         instring: str,
@@ -2641,6 +3070,7 @@ class ParserElement(ABC):
     parseString = replaced_by_pep8("parseString", parse_string)
     scanString = replaced_by_pep8("scanString", scan_string)
     transformString = replaced_by_pep8("transformString", transform_string)
+    planPatches = replaced_by_pep8("planPatches", plan_patches)
     searchString = replaced_by_pep8("searchString", search_string)
     ignoreWhitespace = replaced_by_pep8("ignoreWhitespace", ignore_whitespace)
     leaveWhitespace = replaced_by_pep8("leaveWhitespace", leave_whitespace)
