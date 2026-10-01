@@ -236,6 +236,245 @@ class Test02_WithoutPackrat(ppt.TestParseResultsAsserts, TestCase):
         print("Packrat enabled:", ParserElement._packratEnabled)
         self.assertFalse(ParserElement._packratEnabled, "packrat enabled")
 
+    def testCommitActionsRunOnlyAfterFullSuccess(self):
+        registered = []
+
+        word = pp.Word(pp.alphas).add_commit_action(
+            lambda toks: registered.append(toks[0])
+        )
+
+        result = word.parse_string("abc", parse_all=True)
+        self.assertEqual(["abc"], registered)
+        self.assertEqual(["abc"], result.as_list())
+
+        # trailing extra input violates parse_all: nothing gets committed
+        registered.clear()
+        with self.assertRaises(ParseException):
+            word.parse_string("abc1", parse_all=True)
+        self.assertEqual([], registered)
+
+        # without parse_all, the partial match commits normally
+        registered.clear()
+        word.parse_string("abc1")
+        self.assertEqual(["abc"], registered)
+
+    def testCommitActionsDoNotMutateTokens(self):
+        # commit action return value is ignored - it is not a transformation
+        word = pp.Word(pp.nums).add_commit_action(lambda toks: 99999)
+        result = word.parse_string("42", parse_all=True)
+        self.assertEqual(["42"], result.as_list())
+
+    def testCommitActionReceivesTokensAndLocation(self):
+        seen = []
+
+        def record(s, loc, toks):
+            seen.append((s, loc, toks[0]))
+
+        word = pp.Word(pp.alphas).add_commit_action(record)
+        word.parse_string("  abc", parse_all=True)
+        self.assertEqual([("  abc", 2, "abc")], seen)
+
+    def testCommitActionSetClearsAndReplaces(self):
+        calls = []
+        word = pp.Word(pp.alphas)
+        word.add_commit_action(lambda toks: calls.append("a"))
+        word.add_commit_action(lambda toks: calls.append("b"))
+        word.set_commit_action(lambda toks: calls.append("c"))
+        word.parse_string("abc", parse_all=True)
+        self.assertEqual(["c"], calls)
+
+        calls.clear()
+        word.set_commit_action(None)
+        word.parse_string("abc", parse_all=True)
+        self.assertEqual([], calls)
+
+        with self.assertRaises(TypeError):
+            word.set_commit_action("not callable")
+
+    def testCommitActionsWithMatchFirstCommonPrefix(self):
+        committed = []
+
+        losing = pp.Word(pp.alphas).add_commit_action(
+            lambda s, l, toks, _t="losing": committed.append(_t)
+        )
+        winning = pp.Word(pp.alphas).add_commit_action(
+            lambda s, l, toks, _t="winning": committed.append(_t)
+        )
+
+        # both branches match the shared prefix "abc"; the first then fails
+        # because "!" is missing, so its action must be discarded
+        grammar = pp.MatchFirst([pp.Combine(losing + "!"), winning])
+        grammar.parse_string("abc", parse_all=True)
+        self.assertEqual(["winning"], committed)
+
+        # the first branch does win when the "!" suffix is present
+        committed.clear()
+        grammar.parse_string("abc!", parse_all=True)
+        self.assertEqual(["losing"], committed)
+
+    def testCommitActionsWithOrLongestMatch(self):
+        committed = []
+
+        short = pp.Word(pp.alphas).add_commit_action(
+            lambda s, l, toks, _t="short": committed.append(_t)
+        )
+        long_branch = pp.Combine(
+            pp.Word(pp.alphas).add_commit_action(
+                lambda s, l, toks, _t="long": committed.append(_t)
+            )
+            + "!"
+        )
+
+        grammar = pp.Or([short, long_branch])
+        grammar.parse_string("abc!", parse_all=True)
+        self.assertEqual(["long"], committed)
+
+        committed.clear()
+        grammar.parse_string("abc", parse_all=True)
+        self.assertEqual(["short"], committed)
+
+    def testCommitActionsWithOptional(self):
+        committed = []
+        opt_word = pp.Word(pp.alphas).add_commit_action(
+            lambda toks: committed.append(toks[0])
+        )
+        grammar = pp.Opt(opt_word) + pp.Suppress(";")
+
+        grammar.parse_string("abc;", parse_all=True)
+        self.assertEqual(["abc"], committed)
+
+        committed.clear()
+        grammar.parse_string(";", parse_all=True)
+        self.assertEqual([], committed)
+
+    def testCommitActionsWithRepetition(self):
+        committed = []
+        item = pp.Word(pp.alphas).add_commit_action(
+            lambda toks: committed.append(toks[0])
+        )
+        grammar = pp.OneOrMore(item) + pp.Suppress(";")
+        grammar.parse_string("a bb ccc;", parse_all=True)
+        self.assertEqual(["a", "bb", "ccc"], committed)
+
+        # an over-greedy iteration followed by a failing terminator must not
+        # leave the extra iteration's action behind
+        committed.clear()
+        with self.assertRaises(ParseException):
+            grammar.parse_string("a bb ccc", parse_all=True)
+        self.assertEqual([], committed)
+
+        # ZeroOrMore with zero repetitions commits nothing
+        committed.clear()
+        zom = pp.ZeroOrMore(item) + pp.Suppress(";")
+        zom.parse_string(";", parse_all=True)
+        self.assertEqual([], committed)
+
+    def testCommitActionsWithSequenceFailure(self):
+        committed = []
+        first = pp.Word(pp.alphas).add_commit_action(
+            lambda toks: committed.append(toks[0])
+        )
+        grammar = first + "!" + "?"
+        with self.assertRaises(ParseException):
+            grammar.parse_string("abc!1", parse_all=True)
+        self.assertEqual([], committed)
+
+    def testCommitActionsNotRunByLookaheads(self):
+        committed = []
+
+        looked_ahead = pp.Word(pp.alphas).add_commit_action(
+            lambda toks: committed.append(toks[0])
+        )
+
+        grammar = (
+            pp.FollowedBy(looked_ahead)
+            + pp.Suppress(pp.Word(pp.alphas))
+            + pp.Suppress(":")
+        )
+        grammar.parse_string("abc:", parse_all=True)
+        self.assertEqual([], committed)
+
+        negated = pp.Word("b").add_commit_action(
+            lambda toks: committed.append("neg")
+        )
+        (pp.Word("a") + pp.NotAny(negated)).parse_string("a", parse_all=True)
+        self.assertEqual([], committed)
+
+    def testCommitActionsWithScanString(self):
+        committed = []
+        word = pp.Word(pp.alphas).add_commit_action(
+            lambda toks: committed.append(toks[0])
+        )
+        list(word.scan_string("aa bb 11 cc"))
+        self.assertEqual(["aa", "bb", "cc"], committed)
+
+    def testCommitActionsWithSearchString(self):
+        committed = []
+        word = pp.Word(pp.alphas).add_commit_action(
+            lambda toks: committed.append(toks[0])
+        )
+        word.search_string("aa 1 bb")
+        self.assertEqual(["aa", "bb"], committed)
+
+    def testCommitActionExceptionIsNotRolledBack(self):
+        committed = []
+
+        first = pp.Word("a").add_commit_action(
+            lambda toks: committed.append("first")
+        )
+
+        def failing_commit(toks):
+            raise ValueError("commit boom")
+
+        second = pp.Word("b").add_commit_action(failing_commit)
+        grammar = first + second
+
+        try:
+            grammar.parse_string("ab", parse_all=True)
+        except pp.CommitActionException as exc:
+            self.assertIsInstance(exc, ParseFatalException)
+            self.assertIn("cannot be rolled back", str(exc))
+            self.assertIsInstance(exc.__cause__, ValueError)
+        else:
+            self.fail("expected CommitActionException")
+        # the parse succeeded; the already-executed action stays applied
+        self.assertEqual(["first"], committed)
+
+    def testCommitActionsIsolatedAcrossParseRuns(self):
+        committed = []
+        word = pp.Word(pp.alphas).add_commit_action(
+            lambda toks: committed.append(toks[0])
+        )
+        with self.assertRaises(ParseException):
+            word.parse_string("abc1", parse_all=True)
+        self.assertEqual([], committed)
+
+        # a subsequent successful run is not polluted by the failed one
+        word.parse_string("def", parse_all=True)
+        self.assertEqual(["def"], committed)
+
+    def testCommitActionsCopiedIndependently(self):
+        committed_a = []
+        committed_b = []
+        base = pp.Word(pp.alphas)
+        a = base.copy().add_commit_action(lambda toks: committed_a.append(toks[0]))
+        b = base.copy().add_commit_action(lambda toks: committed_b.append(toks[0]))
+        a.parse_string("abc", parse_all=True)
+        b.parse_string("xyz", parse_all=True)
+        self.assertEqual(["abc"], committed_a)
+        self.assertEqual(["xyz"], committed_b)
+
+    def testRegularParseActionsStillRunImmediately(self):
+        # ordinary parse actions keep their original eager semantics, running
+        # even on branches that later fail; commit actions are the deferred ones
+        eager = []
+        word = pp.Word(pp.alphas).add_parse_action(
+            lambda toks: eager.append(toks[0])
+        )
+        with self.assertRaises(ParseException):
+            word.parse_string("abc1", parse_all=True)
+        self.assertEqual(["abc"], eager)
+
     def testScanStringWithOverlap(self):
         parser = pp.Word(pp.alphas, exact=3)
         without_overlaps = sum(

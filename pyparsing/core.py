@@ -33,6 +33,7 @@ from threading import RLock
 from pathlib import Path
 
 from .warnings import PyparsingDeprecationWarning, PyparsingDiagnosticWarning
+from . import commit_actions as _commit_actions
 from .util import (
     _FifoCache,
     _UnboundedCache,
@@ -502,6 +503,7 @@ class ParserElement(ABC):
 
     def __init__(self, savelist: bool = False) -> None:
         self.parseAction: list[ParseAction] = list()
+        self.commitAction: list[ParseAction] = list()
         self.failAction: typing.Optional[ParseFailAction] = None
         self.customName: str = None  # type: ignore[assignment]
         self._defaultName: typing.Optional[str] = None
@@ -621,6 +623,7 @@ class ParserElement(ABC):
         """
         cpy = copy.copy(self)
         cpy.parseAction = self.parseAction[:]
+        cpy.commitAction = self.commitAction[:]
         cpy.ignoreExprs = self.ignoreExprs[:]
         if self.copyDefaultWhiteChars:
             cpy.whiteChars = set(ParserElement.DEFAULT_WHITE_CHARS)
@@ -823,6 +826,76 @@ class ParserElement(ABC):
 
         self.parseAction += [_trim_arity(fn) for fn in fns]
         self.callDuringTry = self.callDuringTry or callDuringTry or call_during_try
+        return self
+
+    def set_commit_action(self, *fns: ParseAction) -> ParserElement:
+        """
+        Define actions to run only after the entire parse has succeeded.
+
+        Unlike ordinary parse actions (see :meth:`set_parse_action`), commit
+        actions are not executed while alternatives are being explored. Their
+        invocation is deferred until the top-level parse (``parse_string`` or
+        ``scan_string``) has completed successfully, including the
+        ``parse_all`` check that no input was left unconsumed. Actions captured
+        by candidate branches that later fail are discarded, even when those
+        candidates share a common prefix with the branch that ultimately wins.
+
+        Commit actions receive the same arguments as parse actions,
+        ``fn(s, loc, tokens)``, but their return values are ignored (they are
+        intended for side effects such as symbol registration). The ``tokens``
+        argument holds the tokens that the expression actually produced on the
+        successful parse path.
+
+        Packrat memoization never causes an action to run twice: when a cached
+        match is reused, the actions captured during the original evaluation
+        are adopted and each commits at most once.
+
+        .. warning::
+
+            If a commit action raises, the exception propagates as a
+            :class:`CommitActionException` even though the parse itself
+            succeeded. Any commit actions that already ran are not rolled
+            back - commit actions must not assume transactional behavior.
+
+        Example:
+
+        .. testcode::
+
+            import pyparsing as pp
+
+            registered = []
+
+            name = pp.Word(pp.alphas).set_commit_action(
+                lambda t: registered.append(t[0])
+            )
+
+            # the first alternative shares a prefix ("aa") with the second,
+            # but only the winning alternative's action is committed
+            grammar = pp.MatchFirst([pp.Combine(name + "!"), name])
+            grammar.parse_string("aa", parse_all=True)
+            print(registered)
+
+        .. testoutput::
+
+            ['aa']
+        """
+        if list(fns) == [None]:
+            self.commitAction.clear()
+            return self
+
+        if not all(callable(fn) for fn in fns):
+            raise TypeError("commit actions must be callable")
+        self.commitAction[:] = [_trim_arity(fn) for fn in fns]
+        return self
+
+    def add_commit_action(self, *fns: ParseAction) -> ParserElement:
+        """
+        Add one or more commit actions to expression's list of commit actions.
+        See :meth:`set_commit_action`.
+        """
+        if not all(callable(fn) for fn in fns):
+            raise TypeError("commit actions must be callable")
+        self.commitAction += [_trim_arity(fn) for fn in fns]
         return self
 
     def add_condition(
@@ -1033,6 +1106,13 @@ class ParserElement(ABC):
                                 aslist=False,
                                 modal=self.modalResults,
                             )
+        if self.commitAction and (do_actions or self.callDuringTry):
+            for commit_fn in self.commitAction:
+                _commit_actions.enqueue(
+                    _commit_actions._CommitEntry(
+                        commit_fn, instring, tokens_start, ret_tokens
+                    )
+                )
         if debugging:
             # print("Matched", self, "->", ret_tokens.as_list())
             if self.debugActions.debug_match:
@@ -1069,6 +1149,10 @@ class ParserElement(ABC):
     recursion_lock = RLock()
     recursion_memos: collections.abc.MutableMapping[
         tuple[int, Forward, bool], tuple[int, Union[ParseResults, Exception]]
+    ] = {}
+    # commit entries belonging to accepted left-recursion memo values
+    recursion_commit_entries: collections.abc.MutableMapping[
+        tuple[int, Forward, bool], list
     ] = {}
 
     class _CacheType(typing.Protocol):
@@ -1118,6 +1202,11 @@ class ParserElement(ABC):
             value = cache.get(lookup)
             if value is cache.not_in_cache:
                 ParserElement.packrat_cache_stats[MISS] += 1
+                before = (
+                    len(_commit_actions._state().frames[-1])
+                    if do_actions and _commit_actions._state() is not None
+                    else None
+                )
                 try:
                     value = self._parseNoCache(instring, loc, do_actions, callPreParse)
                 except ParseBaseException as pe:
@@ -1125,7 +1214,14 @@ class ParserElement(ABC):
                     cache.set(lookup, pe.__class__(*pe.args))
                     raise
                 else:
-                    cache.set(lookup, (value[0], value[1].copy(), loc))
+                    state = _commit_actions._state()
+                    if before is not None and state is not None:
+                        commit_entries = state.frames[-1][before:]
+                    else:
+                        commit_entries = []
+                    cache.set(
+                        lookup, (value[0], value[1].copy(), loc, commit_entries)
+                    )
                     return value
             else:
                 ParserElement.packrat_cache_stats[HIT] += 1
@@ -1144,8 +1240,12 @@ class ParserElement(ABC):
                             pass
                     raise value
 
-                value = cast(tuple[int, ParseResults, int], value)
+                value = cast(tuple, value)
                 loc_, result, endloc = value[0], value[1].copy(), value[2]
+                commit_entries = value[3] if len(value) > 3 else ()
+                # reuse the entries captured on the original evaluation, so a
+                # cache hit never submits (or duplicates) commit actions
+                _commit_actions.replay(commit_entries)
                 if self.debug and self.debugActions.debug_match:
                     try:
                         self.debugActions.debug_match(
@@ -1169,6 +1269,7 @@ class ParserElement(ABC):
                 ParserElement.packrat_cache_stats
             )
             ParserElement.recursion_memos.clear()
+            ParserElement.recursion_commit_entries.clear()
 
     # class attributes to keep caching status
     _packratEnabled = False
@@ -1358,20 +1459,27 @@ class ParserElement(ABC):
             e.streamline()
         if not self.keepTabs:
             instring = instring.expandtabs()
+        commit_state = _commit_actions.begin_parse()
         try:
             loc, tokens = self._parse(instring, 0)
             if parse_all:
                 loc = self.preParse(instring, loc)
                 se = Empty() + StringEnd().set_debug(False)
                 se._parse(instring, loc)
+            _commit_actions.end_parse_commit(commit_state)
         except _ParseActionIndexError as pa_exc:
+            _commit_actions.end_parse_discard(commit_state)
             raise pa_exc.exc
         except ParseBaseException as exc:
+            _commit_actions.end_parse_discard(commit_state)
             if ParserElement.verbose_stacktrace:
                 raise
 
             # catch and re-raise exception from here, clearing out pyparsing internal stack trace
             raise exc.with_traceback(None)
+        except Exception as exc:
+            _commit_actions.end_parse_discard(commit_state)
+            raise
         else:
             return tokens
 
@@ -1443,15 +1551,18 @@ class ParserElement(ABC):
         matches = 0
         try:
             while loc <= instrlen and matches < max_matches:
+                commit_state = _commit_actions.begin_parse()
                 try:
                     preloc: int = preparseFn(instring, loc)
                     nextLoc: int
                     tokens: ParseResults
                     nextLoc, tokens = parseFn(instring, preloc, callPreParse=False)
                 except ParseException:
+                    _commit_actions.end_parse_discard(commit_state)
                     loc = preloc + 1
                 else:
                     if nextLoc > loc:
+                        _commit_actions.end_parse_commit(commit_state)
                         matches += 1
                         if debug:
                             print(
@@ -1471,6 +1582,7 @@ class ParserElement(ABC):
                         else:
                             loc = nextLoc
                     else:
+                        _commit_actions.end_parse_discard(commit_state)
                         loc = preloc + 1
         except ParseBaseException as exc:
             if ParserElement.verbose_stacktrace:
@@ -2635,6 +2747,8 @@ class ParserElement(ABC):
     setBreak = replaced_by_pep8("setBreak", set_break)
     setParseAction = replaced_by_pep8("setParseAction", set_parse_action)
     addParseAction = replaced_by_pep8("addParseAction", add_parse_action)
+    setCommitAction = replaced_by_pep8("setCommitAction", set_commit_action)
+    addCommitAction = replaced_by_pep8("addCommitAction", add_commit_action)
     addCondition = replaced_by_pep8("addCondition", add_condition)
     setFailAction = replaced_by_pep8("setFailAction", set_fail_action)
     tryParse = replaced_by_pep8("tryParse", try_parse)
@@ -4413,6 +4527,7 @@ class ParseExpression(ParserElement):
             if (
                 isinstance(first, self.__class__)
                 and not first.parseAction
+                and not first.commitAction
                 and first.resultsName is None
                 and not first.debug
             ):
@@ -4425,6 +4540,7 @@ class ParseExpression(ParserElement):
             if (
                 isinstance(last, self.__class__)
                 and not last.parseAction
+                and not last.commitAction
                 and last.resultsName is None
                 and not last.debug
             ):
@@ -4637,35 +4753,43 @@ class And(ParseExpression):
         # (consistent with behavior of `all([])` returning True)
         exprs = iter(self.exprs or (Empty(),))
 
-        # pass False as callPreParse arg to _parse for first element, since we already
-        # pre-parsed the string as part of our And pre-parsing
-        loc, resultlist = next(exprs)._parse(
-            instring, loc, do_actions, callPreParse=False
-        )
+        # all sequence elements share one fate: if a later element fails, the
+        # actions registered by earlier matches must be discarded too
+        _commit_actions.push_frame()
+        matched = False
+        try:
+            # pass False as callPreParse arg to _parse for first element, since we already
+            # pre-parsed the string as part of our And pre-parsing
+            loc, resultlist = next(exprs)._parse(
+                instring, loc, do_actions, callPreParse=False
+            )
 
-        # iterate over remaining expressions
-        raise_syntax_error_immediately = False
-        for e in exprs:
-            # if isinstance(e, And._ErrorStop):
-            if type(e) is And._ErrorStop:
-                raise_syntax_error_immediately = True
-                continue
+            # iterate over remaining expressions
+            raise_syntax_error_immediately = False
+            for e in exprs:
+                # if isinstance(e, And._ErrorStop):
+                if type(e) is And._ErrorStop:
+                    raise_syntax_error_immediately = True
+                    continue
 
-            if raise_syntax_error_immediately:
-                try:
+                if raise_syntax_error_immediately:
+                    try:
+                        loc, exprtokens = e._parse(instring, loc, do_actions)
+                    except ParseSyntaxException:
+                        raise
+                    except ParseBaseException as pe:
+                        pe.__traceback__ = None
+                        raise ParseSyntaxException._from_exception(pe)
+                    except IndexError:
+                        raise ParseSyntaxException(
+                            instring, len(instring), self.errmsg, self
+                        )
+                else:
                     loc, exprtokens = e._parse(instring, loc, do_actions)
-                except ParseSyntaxException:
-                    raise
-                except ParseBaseException as pe:
-                    pe.__traceback__ = None
-                    raise ParseSyntaxException._from_exception(pe)
-                except IndexError:
-                    raise ParseSyntaxException(
-                        instring, len(instring), self.errmsg, self
-                    )
-            else:
-                loc, exprtokens = e._parse(instring, loc, do_actions)
-            resultlist += exprtokens
+                resultlist += exprtokens
+            matched = True
+        finally:
+            _commit_actions.pop_frame(matched)
         return loc, resultlist
 
     def __iadd__(self, other):
@@ -4741,6 +4865,8 @@ class Or(ParseExpression):
         fatals: list[ParseFatalException] = []
         if all(e.callPreparse for e in self.exprs):
             loc = self.preParse(instring, loc)
+        # probe matches are speculative - never retain their commit actions
+        _commit_actions.push_frame()
         for e in self.exprs:
             try:
                 loc2 = e.try_parse(instring, loc, raise_fatal=True)
@@ -4765,6 +4891,7 @@ class Or(ParseExpression):
             else:
                 # save match among all matches, to retry longest to shortest
                 matches.append((loc2, e))
+        _commit_actions.pop_frame(False)
 
         if matches:
             # re-evaluate all matches in descending order of length of match, in case attached actions
@@ -4777,28 +4904,52 @@ class Or(ParseExpression):
                 best_expr = matches[0][1]
                 return best_expr._parse(instring, loc, do_actions)
 
-            longest: tuple[int, typing.Optional[ParseResults]] = -1, None
+            # entries of candidates that end up matching less than probed are
+            # held here; only the finally-returned candidate's are promoted
+            longest: tuple[
+                int, typing.Optional[ParseResults], typing.List
+            ] = -1, None, []
             for loc1, expr1 in matches:
                 if loc1 <= longest[0]:
                     # already have a longer match than this one will deliver, we are done
-                    return longest
+                    _commit_actions.replay(longest[2])
+                    return longest[0], longest[1]
 
+                _commit_actions.push_frame()
+                candidate_matched = False
+                candidate_loc = -1
+                candidate_tokens: typing.Optional[ParseResults] = None
                 try:
-                    loc2, toks = expr1._parse(instring, loc, do_actions)
-                except ParseException as err:
-                    err.__traceback__ = None
-                    if err.loc > maxExcLoc:
-                        maxException = err
-                        maxExcLoc = err.loc
-                else:
-                    if loc2 >= loc1:
-                        return loc2, toks
+                    try:
+                        candidate_loc, candidate_tokens = expr1._parse(
+                            instring, loc, do_actions
+                        )
+                        candidate_matched = True
+                    except ParseException as err:
+                        err.__traceback__ = None
+                        if err.loc > maxExcLoc:
+                            maxException = err
+                            maxExcLoc = err.loc
+                finally:
+                    candidate_entries = _commit_actions.pop_frame(
+                        candidate_matched
+                    )
+                if candidate_matched:
+                    if candidate_loc >= loc1:
+                        # winner - its entries were merged into the
+                        # surrounding frame; discard earlier shorter matches
+                        return candidate_loc, candidate_tokens
                     # didn't match as much as before
-                    elif loc2 > longest[0]:
-                        longest = loc2, toks
+                    elif candidate_loc > longest[0]:
+                        longest = (
+                            candidate_loc,
+                            candidate_tokens,
+                            candidate_entries,
+                        )
 
-            if longest != (-1, None):
-                return longest
+            if longest != (-1, None, []):
+                _commit_actions.replay(longest[2])
+                return longest[0], longest[1]
 
         if fatals:
             if len(fatals) > 1:
@@ -4903,22 +5054,35 @@ class MatchFirst(ParseExpression):
         maxException = None
 
         for e in self.exprs:
+            _commit_actions.push_frame()
+            matched = False
+            candidate_loc = -1
+            candidate_tokens: typing.Optional[ParseResults] = None
             try:
-                return e._parse(instring, loc, do_actions)
-            except ParseFatalException as pfe:
-                pfe.__traceback__ = None
-                pfe.parser_element = e
-                raise
-            except ParseException as err:
-                if err.loc > maxExcLoc:
-                    maxException = err
-                    maxExcLoc = err.loc
-            except IndexError:
-                if len(instring) > maxExcLoc:
-                    maxException = ParseException(
-                        instring, len(instring), e.errmsg, self
+                try:
+                    candidate_loc, candidate_tokens = e._parse(
+                        instring, loc, do_actions
                     )
-                    maxExcLoc = len(instring)
+                    matched = True
+                except ParseFatalException as pfe:
+                    pfe.__traceback__ = None
+                    pfe.parser_element = e
+                    raise
+                except ParseException as err:
+                    if err.loc > maxExcLoc:
+                        maxException = err
+                        maxExcLoc = err.loc
+                except IndexError:
+                    if len(instring) > maxExcLoc:
+                        maxException = ParseException(
+                            instring, len(instring), e.errmsg, self
+                        )
+                        maxExcLoc = len(instring)
+            finally:
+                # entries from losing candidates must never be committed
+                _commit_actions.pop_frame(matched)
+            if matched:
+                return candidate_loc, candidate_tokens
 
         if maxException is not None:
             # infer from this check that all alternatives failed at the current position
@@ -5095,6 +5259,9 @@ class Each(ParseExpression):
         keepMatching = True
         failed: list[ParserElement] = []
         fatals: list[ParseFatalException] = []
+        # all probes below are speculative; the real re-evaluation at the end
+        # collects the commit actions that get kept
+        _commit_actions.push_frame()
         while keepMatching:
             tmpExprs = tmpReqd + tmpOpt + multis
             failed.clear()
@@ -5120,6 +5287,7 @@ class Each(ParseExpression):
 
         # look for any ParseFatalExceptions
         if fatals:
+            _commit_actions.pop_frame(False)
             if len(fatals) > 1:
                 fatals.sort(key=lambda e: -e.loc)
                 if fatals[0].loc == fatals[1].loc:
@@ -5128,6 +5296,7 @@ class Each(ParseExpression):
             raise max_fatal
 
         if tmpReqd:
+            _commit_actions.pop_frame(False)
             missing = ", ".join([str(e) for e in tmpReqd])
             raise ParseException(
                 instring,
@@ -5137,6 +5306,7 @@ class Each(ParseExpression):
 
         # add any unmatched Opts, in case they have default values defined
         matchOrder += [e for e in self.exprs if isinstance(e, Opt) and e.expr in tmpOpt]
+        _commit_actions.pop_frame(False)
 
         total_results = ParseResults([])
         for e in matchOrder:
@@ -5368,7 +5538,11 @@ class IndentedBlock(ParseElementEnhance):
 
         # see if self.expr matches at the current location - if not it will raise an exception
         # and no further work is necessary
-        self.expr.try_parse(instring, anchor_loc, do_actions=do_actions)
+        _commit_actions.push_frame()
+        try:
+            self.expr.try_parse(instring, anchor_loc, do_actions=do_actions)
+        finally:
+            _commit_actions.pop_frame(False)
 
         indent_col = col(anchor_loc, instring)
         peer_detect_expr = self._Indent(indent_col)
@@ -5492,7 +5666,12 @@ class FollowedBy(ParseElementEnhance):
     def parseImpl(self, instring, loc, do_actions=True) -> ParseImplReturnType:
         # by using self._expr.parse and deleting the contents of the returned ParseResults list
         # we keep any named results that were defined in the FollowedBy expression
-        _, ret = self.expr._parse(instring, loc, do_actions=do_actions)
+        # lookahead does not consume input, so its commit actions never commit
+        _commit_actions.push_frame()
+        try:
+            _, ret = self.expr._parse(instring, loc, do_actions=do_actions)
+        finally:
+            _commit_actions.pop_frame(False)
         del ret[:]
 
         return loc, ret
@@ -5558,7 +5737,11 @@ class PrecededBy(ParseElementEnhance):
             if loc < self.retreat:
                 raise ParseException(instring, loc, self.errmsg, self)
             start = loc - self.retreat
-            _, ret = self.expr._parse(instring, start)
+            _commit_actions.push_frame()
+            try:
+                _, ret = self.expr._parse(instring, start)
+            finally:
+                _commit_actions.pop_frame(False)
             return loc, ret
 
         # retreat specified a maximum lookbehind window, iterate
@@ -5569,7 +5752,13 @@ class PrecededBy(ParseElementEnhance):
         for offset in range(1, min(loc, self.retreat + 1) + 1):
             try:
                 # print('trying', offset, instring_slice, repr(instring_slice[loc - offset:]))
-                _, ret = test_expr._parse(instring_slice, len(instring_slice) - offset)
+                _commit_actions.push_frame()
+                try:
+                    _, ret = test_expr._parse(
+                        instring_slice, len(instring_slice) - offset
+                    )
+                finally:
+                    _commit_actions.pop_frame(False)
             except ParseBaseException as pbe:
                 last_expr = pbe
             else:
@@ -5666,7 +5855,14 @@ class NotAny(ParseElementEnhance):
         self.errmsg = f"Found unwanted token, {self.expr}"
 
     def parseImpl(self, instring, loc, do_actions=True) -> ParseImplReturnType:
-        if self.expr.can_parse_next(instring, loc, do_actions=do_actions):
+        _commit_actions.push_frame()
+        try:
+            found = self.expr.can_parse_next(
+                instring, loc, do_actions=do_actions
+            )
+        finally:
+            _commit_actions.pop_frame(False)
+        if found:
             raise ParseException(instring, loc, self.errmsg, self)
         return loc, []
 
@@ -5728,7 +5924,15 @@ class _MultipleMatch(ParseElementEnhance):
                     preloc = self_skip_ignorables(instring, loc)
                 else:
                     preloc = loc
-                loc, tmptokens = self_expr_parse(instring, preloc, do_actions)
+                _commit_actions.push_frame()
+                iteration_matched = False
+                try:
+                    loc, tmptokens = self_expr_parse(
+                        instring, preloc, do_actions
+                    )
+                    iteration_matched = True
+                finally:
+                    _commit_actions.pop_frame(iteration_matched)
                 tokens += tmptokens
                 match_count += 1
         except (ParseException, IndexError):
@@ -5834,8 +6038,15 @@ class ZeroOrMore(_MultipleMatch):
         self._may_return_empty = True
 
     def parseImpl(self, instring, loc, do_actions=True) -> ParseImplReturnType:
+        _commit_actions.push_frame()
+        matched = False
         try:
-            return super().parseImpl(instring, loc, do_actions)
+            try:
+                ret = super().parseImpl(instring, loc, do_actions)
+                matched = True
+                return ret
+            finally:
+                _commit_actions.pop_frame(matched)
         except (ParseException, IndexError):
             return loc, ParseResults([], name=self.resultsName)
 
@@ -5983,10 +6194,16 @@ class Opt(ParseElementEnhance):
 
     def parseImpl(self, instring, loc, do_actions=True) -> ParseImplReturnType:
         self_expr = self.expr
+        _commit_actions.push_frame()
+        matched = False
         try:
-            loc, tokens = self_expr._parse(
-                instring, loc, do_actions, callPreParse=False
-            )
+            try:
+                loc, tokens = self_expr._parse(
+                    instring, loc, do_actions, callPreParse=False
+                )
+                matched = True
+            finally:
+                _commit_actions.pop_frame(matched)
         except (ParseException, IndexError):
             default_value = self.defaultValue
             if default_value is not self.__optionalNotMatched:
@@ -6328,6 +6545,13 @@ class Forward(ParseElementEnhance):
             try:
                 # we are parsing at a specific recursion expansion - use it as-is
                 prev_loc, prev_result = memo[loc, self, do_actions]
+                # reuse the entries captured when this expansion was evaluated,
+                # instead of re-submitting them through a new parse
+                _commit_actions.replay(
+                    ParserElement.recursion_commit_entries.get(
+                        (loc, self, do_actions), ()
+                    )
+                )
                 if isinstance(prev_result, Exception):
                     raise prev_result
                 return prev_loc, prev_result.copy()
@@ -6357,18 +6581,49 @@ class Forward(ParseElementEnhance):
                         if do_actions:
                             # replace the match for do_actions=False as well,
                             # in case the action did backtrack
-                            prev_loc, prev_result = memo[peek_key] = memo[act_key]
+                            prev_loc, prev_result = memo[peek_key] = memo[
+                                act_key
+                            ]
                             del memo[peek_key], memo[act_key]
+                            final_entries = (
+                                ParserElement.recursion_commit_entries.pop(
+                                    act_key, []
+                                )
+                            )
+                            ParserElement.recursion_commit_entries.pop(
+                                peek_key, None
+                            )
+                            _commit_actions.replay(final_entries)
                             return prev_loc, copy.copy(prev_result)
                         del memo[peek_key]
+                        ParserElement.recursion_commit_entries.pop(
+                            peek_key, None
+                        )
                         return prev_loc, copy.copy(prev_peek)
                     # the match did get better: see if we can improve further
                     if do_actions:
+                        _commit_actions.push_frame()
+                        act_ok = False
                         try:
-                            memo[act_key] = super().parseImpl(instring, loc, True)
+                            memo[act_key] = super().parseImpl(
+                                instring, loc, True
+                            )
+                            act_ok = True
                         except ParseException as e:
                             memo[peek_key] = memo[act_key] = (new_loc, e)
+                            ParserElement.recursion_commit_entries.pop(
+                                peek_key, None
+                            )
+                            ParserElement.recursion_commit_entries.pop(
+                                act_key, None
+                            )
                             raise
+                        finally:
+                            act_entries = _commit_actions.pop_frame(act_ok)
+                            if act_ok:
+                                ParserElement.recursion_commit_entries[
+                                    act_key
+                                ] = act_entries
                     prev_loc, prev_peek = memo[peek_key] = new_loc, new_peek
 
     def leave_whitespace(self, recursive: bool = True) -> ParserElement:

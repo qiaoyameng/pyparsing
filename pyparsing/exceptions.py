@@ -336,6 +336,17 @@ class ParseSyntaxException(ParseFatalException):
     """
 
 
+class CommitActionException(ParseFatalException):
+    """
+    Exception raised when a deferred commit action raises while being
+    committed after a successful parse.
+
+    At that point the parse itself has already succeeded; any commit actions
+    that ran before the failing one have produced side effects that cannot be
+    automatically rolled back.
+    """
+
+
 class RecursiveGrammarException(Exception):
     """
     .. deprecated:: 3.0.0

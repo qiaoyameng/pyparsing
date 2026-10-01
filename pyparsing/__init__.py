@@ -249,6 +249,7 @@ __all__ = [
     "CaselessKeyword",
     "CaselessLiteral",
     "CharsNotIn",
+    "CommitActionException",
     "CloseMatch",
     "Combine",
     "DelimitedList",
