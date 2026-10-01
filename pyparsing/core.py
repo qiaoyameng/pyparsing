@@ -29,6 +29,9 @@ import traceback
 import types
 from operator import itemgetter
 from functools import wraps
+import contextlib
+import contextvars
+import threading
 from threading import RLock
 from pathlib import Path
 
@@ -1101,10 +1104,86 @@ class ParserElement(ABC):
         def clear(self) -> None: ...
 
     # class-level argument cache for optimizing repeated calls when backtracking
-    # through recursive expressions
+    # through recursive expressions.
+    # This cache object is only a shared template (and a storage used when parsing
+    # is invoked directly without a parse session, e.g. calling ``element._parse``
+    # manually); actual packrat/left-recursion memoization state for a top-level
+    # parse invocation is kept in a :class:`_ParseSession`, so that:
+    # - threads parsing concurrently (even with the same ParserElement) never see
+    #   each other's cached ParseResults or exceptions,
+    # - a parse action that starts a nested parse (reentrancy) joins the outer
+    #   parse's session instead of clearing the caches the outer parse relies on,
+    # - the state is released automatically when the top-level parse returns or
+    #   raises.
     packrat_cache: _CacheType = NullCache()
     packrat_cache_lock = RLock()
     packrat_cache_stats = [0, 0]
+
+    # size limit used when creating packrat caches for new parse sessions
+    packrat_cache_size_limit: typing.Optional[int] = 128
+    # size limit used when creating left-recursion memos for new parse sessions
+    recursion_memo_size_limit: typing.Optional[int] = None
+
+    # contextvar holding the stack of parse sessions belonging to the current
+    # context; each thread starts with its own empty stack, and a stack copied
+    # into a new thread/context by ``contextvars`` is filtered by owning thread
+    # so that parse sessions never leak or get shared across threads
+    _parse_sessions: "contextvars.ContextVar[list]" = contextvars.ContextVar(
+        "_parse_sessions", default=None
+    )
+
+    @staticmethod
+    def _get_parse_session() -> "typing.Optional[_ParseSession]":
+        """
+        Return the innermost active :class:`_ParseSession` for the current
+        thread/context, or ``None`` if no top-level parse is in progress.
+        Sessions started in another thread are never visible here.
+        """
+        stack = ParserElement._parse_sessions.get()
+        if stack:
+            session = stack[-1]
+            if session.owner_ident == threading.get_ident():
+                return session
+        return None
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _parse_session_context():
+        """
+        Establish a parse session for one top-level parse invocation.
+
+        Reentrant parses started from within a parse action (in the same
+        thread) reuse the outermost parse's session; the session, with its
+        packrat cache and left-recursion memo, is only discarded when the
+        outermost parse finishes, even if the nested parse raises. Each
+        thread and each ``contextvars.Context`` gets its own session.
+        """
+        # The contextvar may have been copied into a new thread or into a new
+        # ``contextvars.Context``; replace it with a fresh list holding only
+        # sessions owned by the current thread, so that caches started in
+        # another thread are never shared or mutated here.
+        inherited = ParserElement._parse_sessions.get() or ()
+        stack = [
+            session
+            for session in inherited
+            if session.owner_ident == threading.get_ident()
+        ]
+        token = ParserElement._parse_sessions.set(stack)
+        try:
+            if stack:
+                # reentrant parse from a parse action in the same thread:
+                # join the outer parse's session instead of clearing it
+                yield stack[-1]
+            else:
+                session = _ParseSession()
+                stack.append(session)
+                try:
+                    yield session
+                finally:
+                    stack.remove(session)
+        finally:
+            ParserElement._parse_sessions.reset(token)
+
 
     # this method gets repeatedly called during backtracking with the same arguments -
     # we can cache these arguments and save ourselves the trouble of re-parsing the contained expression
@@ -1113,48 +1192,66 @@ class ParserElement(ABC):
     ) -> tuple[int, ParseResults]:
         HIT, MISS = 0, 1
         lookup = (self, instring, loc, callPreParse, do_actions)
-        with ParserElement.packrat_cache_lock:
+        session = ParserElement._get_parse_session()
+        if session is not None:
+            cache = session.get_packrat_cache()
+            stats = session.packrat_stats
+            cache_lock = session.packrat_lock
+        else:
             cache = ParserElement.packrat_cache
+            stats = ParserElement.packrat_cache_stats
+            cache_lock = ParserElement.packrat_cache_lock
+
+        # only the cache lookup/update is serialized; parsing (which may run
+        # parse actions that start nested parses or synchronize with other
+        # threads) must not hold any cache lock
+        with cache_lock:
             value = cache.get(lookup)
-            if value is cache.not_in_cache:
-                ParserElement.packrat_cache_stats[MISS] += 1
-                try:
-                    value = self._parseNoCache(instring, loc, do_actions, callPreParse)
-                except ParseBaseException as pe:
-                    # cache a copy of the exception, without the traceback
-                    cache.set(lookup, pe.__class__(*pe.args))
-                    raise
-                else:
-                    cache.set(lookup, (value[0], value[1].copy(), loc))
-                    return value
+            cached = value is not cache.not_in_cache
+            if not cached:
+                stats[MISS] += 1
             else:
-                ParserElement.packrat_cache_stats[HIT] += 1
-                if self.debug and self.debugActions.debug_try:
-                    try:
-                        self.debugActions.debug_try(instring, loc, self, cache_hit=True)  # type: ignore [call-arg]
-                    except TypeError:
-                        pass
-                if isinstance(value, Exception):
-                    if self.debug and self.debugActions.debug_fail:
-                        try:
-                            self.debugActions.debug_fail(
-                                instring, loc, self, value, cache_hit=True  # type: ignore [call-arg]
-                            )
-                        except TypeError:
-                            pass
-                    raise value
+                stats[HIT] += 1
 
-                value = cast(tuple[int, ParseResults, int], value)
-                loc_, result, endloc = value[0], value[1].copy(), value[2]
-                if self.debug and self.debugActions.debug_match:
-                    try:
-                        self.debugActions.debug_match(
-                            instring, loc_, endloc, self, result, cache_hit=True  # type: ignore [call-arg]
-                        )
-                    except TypeError:
-                        pass
+        if not cached:
+            try:
+                value = self._parseNoCache(instring, loc, do_actions, callPreParse)
+            except ParseBaseException as pe:
+                # cache a copy of the exception, without the traceback
+                with cache_lock:
+                    cache.set(lookup, pe.__class__(*pe.args))
+                raise
+            else:
+                with cache_lock:
+                    cache.set(lookup, (value[0], value[1].copy(), loc))
+                return value
 
-                return loc_, result
+        if self.debug and self.debugActions.debug_try:
+            try:
+                self.debugActions.debug_try(instring, loc, self, cache_hit=True)  # type: ignore [call-arg]
+            except TypeError:
+                pass
+        if isinstance(value, Exception):
+            if self.debug and self.debugActions.debug_fail:
+                try:
+                    self.debugActions.debug_fail(
+                        instring, loc, self, value, cache_hit=True  # type: ignore [call-arg]
+                    )
+                except TypeError:
+                    pass
+            raise value
+
+        value = cast(tuple[int, ParseResults, int], value)
+        loc_, result, endloc = value[0], value[1].copy(), value[2]
+        if self.debug and self.debugActions.debug_match:
+            try:
+                self.debugActions.debug_match(
+                    instring, loc_, endloc, self, result, cache_hit=True  # type: ignore [call-arg]
+                )
+            except TypeError:
+                pass
+
+        return loc_, result
 
     _parse = _parseNoCache
 
@@ -1162,13 +1259,23 @@ class ParserElement(ABC):
     def reset_cache() -> None:
         """
         Clears caches used by packrat and left-recursion.
+
+        When called from inside a top-level parse (including from a parse
+        action that performs a nested parse), only that parse's session-local
+        caches and statistics are cleared; other threads and other parse
+        sessions are unaffected. When called outside of any parse, the shared
+        template cache used for direct ``_parse()`` calls is cleared.
         """
         with ParserElement.packrat_cache_lock:
-            ParserElement.packrat_cache.clear()
-            ParserElement.packrat_cache_stats[:] = [0] * len(
-                ParserElement.packrat_cache_stats
-            )
-            ParserElement.recursion_memos.clear()
+            session = ParserElement._get_parse_session()
+            if session is not None:
+                session.reset_caches()
+            else:
+                ParserElement.packrat_cache.clear()
+                ParserElement.packrat_cache_stats[:] = [0] * len(
+                    ParserElement.packrat_cache_stats
+                )
+                ParserElement.recursion_memos.clear()
 
     # class attributes to keep caching status
     _packratEnabled = False
@@ -1182,12 +1289,17 @@ class ParserElement(ABC):
         This method also works if neither Packrat nor Left Recursion are enabled.
         This makes it safe to call before activating Packrat nor Left Recursion
         to clear any previous settings.
+
+        Disabling memoization affects new parse sessions immediately. If called
+        while a parse is in progress on the same thread, that parse's
+        session-local caches are also reset; sessions parsing on other threads
+        keep their own caches until they finish.
         """
         with ParserElement.packrat_cache_lock:
-            ParserElement.reset_cache()
             ParserElement._left_recursion_enabled = False
             ParserElement._packratEnabled = False
             ParserElement._parse = ParserElement._parseNoCache
+            ParserElement.reset_cache()
 
     @staticmethod
     def enable_left_recursion(
@@ -1233,12 +1345,19 @@ class ParserElement(ABC):
         Bounded Recursion parsing works similar but not identical to Packrat parsing,
         thus the two cannot be used together. Use ``force=True`` to disable any
         previous, conflicting settings.
+
+        The recursion memo table is private to each top-level parse (each
+        invocation of ``parse_string``/``scan_string`` and its reentrant parses
+        from parse actions), so concurrent parses - even of the same
+        :class:`ParserElement` in different threads - never share entries, and
+        the table is discarded when the parse completes.
         """
         with ParserElement.packrat_cache_lock:
             if force:
                 ParserElement.disable_memoization()
             elif ParserElement._packratEnabled:
                 raise RuntimeError("Packrat and Bounded Recursion are not compatible")
+            ParserElement.recursion_memo_size_limit = cache_size_limit
             if cache_size_limit is None:
                 ParserElement.recursion_memos = _UnboundedMemo()
             elif cache_size_limit > 0:
@@ -1246,6 +1365,10 @@ class ParserElement(ABC):
             else:
                 raise NotImplementedError(f"Memo size of {cache_size_limit}")
             ParserElement._left_recursion_enabled = True
+            # apply to a parse already in progress on this thread, if any
+            session = ParserElement._get_parse_session()
+            if session is not None:
+                session.reset_recursion_memos()
 
     @staticmethod
     def enable_packrat(
@@ -1282,6 +1405,14 @@ class ParserElement(ABC):
         Packrat parsing works similar but not identical to Bounded Recursion parsing,
         thus the two cannot be used together. Use ``force=True`` to disable any
         previous, conflicting settings.
+
+        The packrat cache is private to each top-level parse: each invocation of
+        ``parse_string``/``scan_string`` gets its own cache, shared by any
+        reentrant parses started from its parse actions, but never shared with
+        other threads or with later parses. The cache (including cached
+        :class:`ParseResults` and exceptions) is discarded when the parse
+        returns or raises. Reusing the same :class:`ParserElement` across
+        threads and parses remains fully supported.
         """
         with ParserElement.packrat_cache_lock:
             if force:
@@ -1293,11 +1424,16 @@ class ParserElement(ABC):
                 return
 
             ParserElement._packratEnabled = True
+            ParserElement.packrat_cache_size_limit = cache_size_limit
             if cache_size_limit is None:
                 ParserElement.packrat_cache = _UnboundedCache()
             else:
                 ParserElement.packrat_cache = _FifoCache(cache_size_limit)
             ParserElement._parse = ParserElement._parseCache
+            # apply to a parse already in progress on this thread, if any
+            session = ParserElement._get_parse_session()
+            if session is not None:
+                session.reset_packrat_cache()
 
     def parse_string(
         self, instring: str, parse_all: bool = False, **kwargs
@@ -1351,29 +1487,32 @@ class ParserElement(ABC):
 
         parse_all = parse_all or parseAll
 
-        ParserElement.reset_cache()
         if not self.streamlined:
             self.streamline()
         for e in self.ignoreExprs:
             e.streamline()
         if not self.keepTabs:
             instring = instring.expandtabs()
-        try:
-            loc, tokens = self._parse(instring, 0)
-            if parse_all:
-                loc = self.preParse(instring, loc)
-                se = Empty() + StringEnd().set_debug(False)
-                se._parse(instring, loc)
-        except _ParseActionIndexError as pa_exc:
-            raise pa_exc.exc
-        except ParseBaseException as exc:
-            if ParserElement.verbose_stacktrace:
-                raise
+        # all memoization state for this parse belongs to a private parse
+        # session: nested parses from parse actions share it, other threads
+        # and subsequent parses get their own
+        with ParserElement._parse_session_context():
+            try:
+                loc, tokens = self._parse(instring, 0)
+                if parse_all:
+                    loc = self.preParse(instring, loc)
+                    se = Empty() + StringEnd().set_debug(False)
+                    se._parse(instring, loc)
+            except _ParseActionIndexError as pa_exc:
+                raise pa_exc.exc
+            except ParseBaseException as exc:
+                if ParserElement.verbose_stacktrace:
+                    raise
 
-            # catch and re-raise exception from here, clearing out pyparsing internal stack trace
-            raise exc.with_traceback(None)
-        else:
-            return tokens
+                # catch and re-raise exception from here, clearing out pyparsing internal stack trace
+                raise exc.with_traceback(None)
+            else:
+                return tokens
 
     def scan_string(
         self,
@@ -1439,45 +1578,48 @@ class ParserElement(ABC):
         else:
             preparseFn = self.preParse
         parseFn = self._parse
-        ParserElement.reset_cache()
         matches = 0
-        try:
-            while loc <= instrlen and matches < max_matches:
-                try:
-                    preloc: int = preparseFn(instring, loc)
-                    nextLoc: int
-                    tokens: ParseResults
-                    nextLoc, tokens = parseFn(instring, preloc, callPreParse=False)
-                except ParseException:
-                    loc = preloc + 1
-                else:
-                    if nextLoc > loc:
-                        matches += 1
-                        if debug:
-                            print(
-                                {
-                                    "tokens": tokens.as_list(),
-                                    "start": preloc,
-                                    "end": nextLoc,
-                                }
-                            )
-                        yield tokens, preloc, nextLoc
-                        if overlap:
-                            nextloc = preparseFn(instring, loc)
-                            if nextloc > loc:
-                                loc = nextLoc
-                            else:
-                                loc += 1
-                        else:
-                            loc = nextLoc
-                    else:
+        # the scan owns one parse session for the lifetime of the generator;
+        # nested parses from parse actions join it, and it is released even if
+        # the consumer abandons the generator or a match raises
+        with ParserElement._parse_session_context():
+            try:
+                while loc <= instrlen and matches < max_matches:
+                    try:
+                        preloc: int = preparseFn(instring, loc)
+                        nextLoc: int
+                        tokens: ParseResults
+                        nextLoc, tokens = parseFn(instring, preloc, callPreParse=False)
+                    except ParseException:
                         loc = preloc + 1
-        except ParseBaseException as exc:
-            if ParserElement.verbose_stacktrace:
-                raise
+                    else:
+                        if nextLoc > loc:
+                            matches += 1
+                            if debug:
+                                print(
+                                    {
+                                        "tokens": tokens.as_list(),
+                                        "start": preloc,
+                                        "end": nextLoc,
+                                    }
+                                )
+                            yield tokens, preloc, nextLoc
+                            if overlap:
+                                nextloc = preparseFn(instring, loc)
+                                if nextloc > loc:
+                                    loc = nextLoc
+                                else:
+                                    loc += 1
+                            else:
+                                loc = nextLoc
+                        else:
+                            loc = preloc + 1
+            except ParseBaseException as exc:
+                if ParserElement.verbose_stacktrace:
+                    raise
 
-            # catch and re-raise exception from here, clears out pyparsing internal stack trace
-            raise exc.with_traceback(None)
+                # catch and re-raise exception from here, clears out pyparsing internal stack trace
+                raise exc.with_traceback(None)
 
     def transform_string(self, instring: str, *, debug: bool = False) -> str:
         """
@@ -2654,6 +2796,75 @@ class ParserElement(ABC):
     canParseNext = replaced_by_pep8("canParseNext", can_parse_next)
     defaultName = default_name
     # fmt: on
+
+
+class _ParseSession:
+    """
+    Memoization state owned by a single top-level parse invocation.
+
+    A parse session holds the packrat cache, the left-recursion memo table and
+    their statistics. Sessions are created by
+    :meth:`ParserElement._parse_session_context`; a parse action that starts a
+    nested parse (direct or indirect reentrancy) reuses the outer parse's
+    session, while every thread (and every independent ``contextvars``
+    context) gets its own session, so cached ``ParseResults`` and exceptions
+    never leak across parses. The session is discarded automatically when the
+    outermost parse returns or raises, releasing every cached result.
+    """
+
+    __slots__ = (
+        "owner_ident",
+        "_packrat_cache",
+        "packrat_stats",
+        "packrat_lock",
+        "_recursion_memos",
+        "recursion_lock",
+    )
+
+    def __init__(self) -> None:
+        self.owner_ident = threading.get_ident()
+        self._packrat_cache: typing.Optional[ParserElement._CacheType] = None
+        self.packrat_stats = [0, 0]
+        self.packrat_lock = RLock()
+        self._recursion_memos = None
+        self.recursion_lock = RLock()
+
+    @staticmethod
+    def _new_packrat_cache() -> "ParserElement._CacheType":
+        size_limit = ParserElement.packrat_cache_size_limit
+        if size_limit is None:
+            cache = _UnboundedCache()
+        else:
+            cache = _FifoCache(size_limit)
+        return typing.cast(ParserElement._CacheType, cache)
+
+    def get_packrat_cache(self) -> "ParserElement._CacheType":
+        if self._packrat_cache is None:
+            self._packrat_cache = self._new_packrat_cache()
+        return self._packrat_cache
+
+    def reset_packrat_cache(self) -> None:
+        self._packrat_cache = None
+        self.packrat_stats[:] = [0, 0]
+
+    @staticmethod
+    def _new_recursion_memos():
+        size_limit = ParserElement.recursion_memo_size_limit
+        if size_limit is None:
+            return _UnboundedMemo()
+        return _LRUMemo(capacity=size_limit)
+
+    def get_recursion_memos(self):
+        if self._recursion_memos is None:
+            self._recursion_memos = self._new_recursion_memos()
+        return self._recursion_memos
+
+    def reset_recursion_memos(self) -> None:
+        self._recursion_memos = None
+
+    def reset_caches(self) -> None:
+        self.reset_packrat_cache()
+        self.reset_recursion_memos()
 
 
 class _PendingSkip(ParserElement):
@@ -6323,8 +6534,13 @@ class Forward(ParseElementEnhance):
         # actions: We do not want to run the actions too often while expanding. Thus,
         # we expand using `do_actions=False` and only run `do_actions=True` if the next
         # recursion level is acceptable.
-        with ParserElement.recursion_lock:
-            memo = ParserElement.recursion_memos
+        session = ParserElement._get_parse_session()
+        recursion_lock = session.recursion_lock if session is not None else ParserElement.recursion_lock
+        with recursion_lock:
+            if session is not None:
+                memo = session.get_recursion_memos()
+            else:
+                memo = ParserElement.recursion_memos
             try:
                 # we are parsing at a specific recursion expansion - use it as-is
                 prev_loc, prev_result = memo[loc, self, do_actions]
