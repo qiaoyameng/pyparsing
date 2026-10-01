@@ -149,6 +149,7 @@ from .core import __diag__, __compat__
 from .results import *
 from .core import *
 from .core import _builtin_exprs as core_builtin_exprs
+from .grammar_analysis import *
 from .helpers import *
 from .helpers import _builtin_exprs as helper_builtin_exprs
 
@@ -257,6 +258,9 @@ __all__ = [
     "Empty",
     "FollowedBy",
     "Forward",
+    "GrammarIssue",
+    "GrammarIssueKind",
+    "GrammarValidationResult",
     "GoToColumn",
     "Group",
     "IndentedBlock",
@@ -361,6 +365,7 @@ __all__ = [
     "ungroup",
     "unicode_set",
     "unicode_string",
+    "validate_grammar",
     "with_attribute",
     "with_class",
     # pre-PEP8 compatibility names

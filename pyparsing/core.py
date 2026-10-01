@@ -51,6 +51,9 @@ from .actions import *
 from .results import ParseResults, _ParseResultsWithOffset
 from .unicode import pyparsing_unicode
 
+if typing.TYPE_CHECKING:
+    from .grammar_analysis import GrammarValidationResult
+
 _MAX_INT = sys.maxsize
 str_type: tuple[type, ...] = (str, bytes)
 
@@ -2247,6 +2250,29 @@ class ParserElement(ABC):
             stacklevel=2,
         )
         self._checkRecursion([])
+
+    def validate_grammar(self) -> "GrammarValidationResult":
+        """
+        Statically check this expression for recursive :class:`Forward`
+        reference cycles before running into a bare ``RecursionError``
+        at parse time.
+
+        Distinguishes no-progress loops (cycles that recurse without
+        consuming input and have no terminating alternative) from legal
+        left recursion (cycles with a base case, permitted once
+        :meth:`ParserElement.enable_left_recursion` has been called) and
+        from ordinary terminating recursion. ``ignore()`` expressions,
+        :class:`Opt`, and :class:`ZeroOrMore` elements are included in
+        the analysis; custom :class:`ParserElement` subclasses that
+        cannot be analyzed statically are reported as unknown rather
+        than as errors.
+
+        Returns a :class:`GrammarValidationResult`; see
+        :func:`validate_grammar` for details.
+        """
+        from .grammar_analysis import validate_grammar
+
+        return validate_grammar(self)
 
     def parse_file(
         self,
