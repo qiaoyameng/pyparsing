@@ -27,6 +27,15 @@ Required Python versions by pyparsing version
 
 Version 3.3.3 - in development
 ------------------------------
+- Scoped packrat and left-recursion memo caches to each public parse invocation.
+  Reentrant parses started from parse actions now get a nested session and cannot
+  clear caches still used by the enclosing parse; concurrent parses in different
+  threads no longer share cached `ParseResults` or exceptions. `reset_cache()`
+  called during parsing clears only the innermost active session, and caches are
+  released when a parse session exits, including after an exception. Enabling or
+  disabling memoization applies to subsequent parse sessions, while parser
+  elements themselves remain reusable.
+
 - Added support for Python 3.15.
 
 - Parse actions that return a tuple value for a named expression formerly saved

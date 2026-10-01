@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import collections.abc
 from collections import deque
+import contextlib
+import contextvars
 import os
 import typing
 from typing import (
@@ -53,6 +55,45 @@ from .unicode import pyparsing_unicode
 
 _MAX_INT = sys.maxsize
 str_type: tuple[type, ...] = (str, bytes)
+
+
+class _ParseSession:
+    """Memoization state owned by one public parsing invocation."""
+
+    __slots__ = (
+        "packrat_enabled",
+        "packrat_cache",
+        "packrat_cache_lock",
+        "packrat_cache_stats",
+        "left_recursion_enabled",
+        "recursion_lock",
+        "recursion_memos",
+    )
+
+    def __init__(
+        self,
+        *,
+        packrat_enabled: bool,
+        packrat_cache: typing.Optional["ParserElement._CacheType"],
+        left_recursion_enabled: bool,
+        recursion_memos: typing.Optional[collections.abc.MutableMapping],
+    ) -> None:
+        self.packrat_enabled = packrat_enabled
+        self.packrat_cache = packrat_cache
+        self.packrat_cache_lock = RLock()
+        self.packrat_cache_stats = [0, 0]
+        self.left_recursion_enabled = left_recursion_enabled
+        self.recursion_lock = RLock()
+        self.recursion_memos = recursion_memos
+
+    def clear(self) -> None:
+        if self.packrat_cache is not None:
+            with self.packrat_cache_lock:
+                self.packrat_cache.clear()
+                self.packrat_cache_stats[:] = [0, 0]
+        if self.recursion_memos is not None:
+            with self.recursion_lock:
+                self.recursion_memos.clear()
 
 #
 # Copyright (c) 2003-2022  Paul T. McGuire
@@ -1065,12 +1106,6 @@ class ParserElement(ABC):
         else:
             return True
 
-    # cache for left-recursion in Forward references
-    recursion_lock = RLock()
-    recursion_memos: collections.abc.MutableMapping[
-        tuple[int, Forward, bool], tuple[int, Union[ParseResults, Exception]]
-    ] = {}
-
     class _CacheType(typing.Protocol):
         """
         Class to be used for packrat and left-recursion cacheing of results
@@ -1100,11 +1135,77 @@ class ParserElement(ABC):
 
         def clear(self) -> None: ...
 
-    # class-level argument cache for optimizing repeated calls when backtracking
-    # through recursive expressions
+    # The class-level caches are configuration templates. Caches used while parsing
+    # are private to a parse session and therefore are thread-local and reentrant.
     packrat_cache: _CacheType = NullCache()
     packrat_cache_lock = RLock()
     packrat_cache_stats = [0, 0]
+    recursion_lock = RLock()
+    recursion_memos: collections.abc.MutableMapping[
+        tuple[int, Forward, bool], tuple[int, Union[ParseResults, Exception]]
+    ] = {}
+    _parse_session: contextvars.ContextVar[
+        typing.Optional[_ParseSession]
+    ] = contextvars.ContextVar("_parse_session", default=None)
+    _packratEnabled = False
+    _left_recursion_enabled = False
+    _active_packrat_sessions = 0
+
+    @classmethod
+    def _new_packrat_cache(cls) -> _CacheType:
+        if type(cls.packrat_cache) is _FifoCache:
+            return _FifoCache(cls.packrat_cache.size)
+        return _UnboundedCache()
+
+    @classmethod
+    def _new_recursion_memos(
+        cls,
+    ) -> collections.abc.MutableMapping[
+        tuple[int, Forward, bool], tuple[int, Union[ParseResults, Exception]]
+    ]:
+        memo = cls.recursion_memos
+        if isinstance(memo, _LRUMemo):
+            return _LRUMemo(capacity=memo._capacity)
+        return _UnboundedMemo()
+
+    @classmethod
+    @contextlib.contextmanager
+    def _parse_session_context(cls):
+        packrat_enabled = False
+        with cls.packrat_cache_lock:
+            packrat_enabled = cls._packratEnabled
+            session = _ParseSession(
+                packrat_enabled=packrat_enabled,
+                packrat_cache=(
+                    cls._new_packrat_cache() if packrat_enabled else None
+                ),
+                left_recursion_enabled=cls._left_recursion_enabled,
+                recursion_memos=(
+                    cls._new_recursion_memos()
+                    if cls._left_recursion_enabled
+                    else None
+                ),
+            )
+            if packrat_enabled:
+                cls._active_packrat_sessions += 1
+        token = cls._parse_session.set(session)
+        try:
+            yield session
+        finally:
+            session.clear()
+            if packrat_enabled:
+                with cls.packrat_cache_lock:
+                    cls._active_packrat_sessions -= 1
+                    if (
+                        not cls._packratEnabled
+                        and cls._active_packrat_sessions == 0
+                    ):
+                        cls._parse = cls._parseNoCache
+            cls._parse_session.reset(token)
+
+    @staticmethod
+    def _current_parse_session() -> typing.Optional[_ParseSession]:
+        return ParserElement._parse_session.get()
 
     # this method gets repeatedly called during backtracking with the same arguments -
     # we can cache these arguments and save ourselves the trouble of re-parsing the contained expression
@@ -1113,11 +1214,15 @@ class ParserElement(ABC):
     ) -> tuple[int, ParseResults]:
         HIT, MISS = 0, 1
         lookup = (self, instring, loc, callPreParse, do_actions)
-        with ParserElement.packrat_cache_lock:
-            cache = ParserElement.packrat_cache
+        session = ParserElement._current_parse_session()
+        if session is None or not session.packrat_enabled:
+            return self._parseNoCache(instring, loc, do_actions, callPreParse)
+
+        cache = cast(ParserElement._CacheType, session.packrat_cache)
+        with session.packrat_cache_lock:
             value = cache.get(lookup)
             if value is cache.not_in_cache:
-                ParserElement.packrat_cache_stats[MISS] += 1
+                session.packrat_cache_stats[MISS] += 1
                 try:
                     value = self._parseNoCache(instring, loc, do_actions, callPreParse)
                 except ParseBaseException as pe:
@@ -1127,52 +1232,58 @@ class ParserElement(ABC):
                 else:
                     cache.set(lookup, (value[0], value[1].copy(), loc))
                     return value
-            else:
-                ParserElement.packrat_cache_stats[HIT] += 1
-                if self.debug and self.debugActions.debug_try:
-                    try:
-                        self.debugActions.debug_try(instring, loc, self, cache_hit=True)  # type: ignore [call-arg]
-                    except TypeError:
-                        pass
-                if isinstance(value, Exception):
-                    if self.debug and self.debugActions.debug_fail:
-                        try:
-                            self.debugActions.debug_fail(
-                                instring, loc, self, value, cache_hit=True  # type: ignore [call-arg]
-                            )
-                        except TypeError:
-                            pass
-                    raise value
+            session.packrat_cache_stats[HIT] += 1
 
-                value = cast(tuple[int, ParseResults, int], value)
-                loc_, result, endloc = value[0], value[1].copy(), value[2]
-                if self.debug and self.debugActions.debug_match:
-                    try:
-                        self.debugActions.debug_match(
-                            instring, loc_, endloc, self, result, cache_hit=True  # type: ignore [call-arg]
-                        )
-                    except TypeError:
-                        pass
+        if self.debug and self.debugActions.debug_try:
+            try:
+                self.debugActions.debug_try(instring, loc, self, cache_hit=True)  # type: ignore [call-arg]
+            except TypeError:
+                pass
+        if isinstance(value, Exception):
+            if self.debug and self.debugActions.debug_fail:
+                try:
+                    self.debugActions.debug_fail(
+                        instring, loc, self, value, cache_hit=True  # type: ignore [call-arg]
+                    )
+                except TypeError:
+                    pass
+            raise value
 
-                return loc_, result
+        value = cast(tuple[int, ParseResults, int], value)
+        loc_, result, endloc = value[0], value[1].copy(), value[2]
+        if self.debug and self.debugActions.debug_match:
+            try:
+                self.debugActions.debug_match(
+                    instring, loc_, endloc, self, result, cache_hit=True  # type: ignore [call-arg]
+                )
+            except TypeError:
+                pass
 
-    _parse = _parseNoCache
+        return loc_, result
+
+    _parse = _parseCache
 
     @staticmethod
     def reset_cache() -> None:
         """
-        Clears caches used by packrat and left-recursion.
+        Clear packrat and left-recursion caches for the current parse session.
+
+        When called from a parse action or a reentrant parse invocation, only the
+        innermost active session is affected. Enclosing sessions and sessions in
+        other threads retain their caches. When called outside parsing, this clears
+        the class-level template caches.
         """
-        with ParserElement.packrat_cache_lock:
+        session = ParserElement._current_parse_session()
+        if session is not None:
+            session.clear()
+            return
+
+        with ParserElement.packrat_cache_lock, ParserElement.recursion_lock:
             ParserElement.packrat_cache.clear()
             ParserElement.packrat_cache_stats[:] = [0] * len(
                 ParserElement.packrat_cache_stats
             )
             ParserElement.recursion_memos.clear()
-
-    # class attributes to keep caching status
-    _packratEnabled = False
-    _left_recursion_enabled = False
 
     @staticmethod
     def disable_memoization() -> None:
@@ -1182,12 +1293,20 @@ class ParserElement(ABC):
         This method also works if neither Packrat nor Left Recursion are enabled.
         This makes it safe to call before activating Packrat nor Left Recursion
         to clear any previous settings.
+
+        Parsing sessions already in progress keep the memoization mode captured
+        when they started; later sessions start with memoization disabled.
         """
         with ParserElement.packrat_cache_lock:
-            ParserElement.reset_cache()
+            ParserElement.packrat_cache.clear()
+            ParserElement.packrat_cache_stats[:] = [0] * len(
+                ParserElement.packrat_cache_stats
+            )
+            ParserElement.recursion_memos.clear()
             ParserElement._left_recursion_enabled = False
             ParserElement._packratEnabled = False
-            ParserElement._parse = ParserElement._parseNoCache
+            if ParserElement._active_packrat_sessions == 0:
+                ParserElement._parse = ParserElement._parseNoCache
 
     @staticmethod
     def enable_left_recursion(
@@ -1233,6 +1352,10 @@ class ParserElement(ABC):
         Bounded Recursion parsing works similar but not identical to Packrat parsing,
         thus the two cannot be used together. Use ``force=True`` to disable any
         previous, conflicting settings.
+
+        The setting is captured when a public parse method starts. Enabling or
+        disabling bounded recursion does not change an already-running parse, but
+        reentrant parse calls start a new session and use the current setting.
         """
         with ParserElement.packrat_cache_lock:
             if force:
@@ -1282,6 +1405,10 @@ class ParserElement(ABC):
         Packrat parsing works similar but not identical to Bounded Recursion parsing,
         thus the two cannot be used together. Use ``force=True`` to disable any
         previous, conflicting settings.
+
+        The setting is captured when a public parse method starts. Enabling or
+        disabling packrat parsing does not change an already-running parse, but
+        reentrant parse calls start a new session and use the current setting.
         """
         with ParserElement.packrat_cache_lock:
             if force:
@@ -1297,7 +1424,8 @@ class ParserElement(ABC):
                 ParserElement.packrat_cache = _UnboundedCache()
             else:
                 ParserElement.packrat_cache = _FifoCache(cache_size_limit)
-            ParserElement._parse = ParserElement._parseCache
+            if ParserElement._active_packrat_sessions == 0:
+                ParserElement._parse = ParserElement._parseCache
 
     def parse_string(
         self, instring: str, parse_all: bool = False, **kwargs
@@ -1351,29 +1479,29 @@ class ParserElement(ABC):
 
         parse_all = parse_all or parseAll
 
-        ParserElement.reset_cache()
         if not self.streamlined:
             self.streamline()
         for e in self.ignoreExprs:
             e.streamline()
         if not self.keepTabs:
             instring = instring.expandtabs()
-        try:
-            loc, tokens = self._parse(instring, 0)
-            if parse_all:
-                loc = self.preParse(instring, loc)
-                se = Empty() + StringEnd().set_debug(False)
-                se._parse(instring, loc)
-        except _ParseActionIndexError as pa_exc:
-            raise pa_exc.exc
-        except ParseBaseException as exc:
-            if ParserElement.verbose_stacktrace:
-                raise
+        with ParserElement._parse_session_context():
+            try:
+                loc, tokens = self._parse(instring, 0)
+                if parse_all:
+                    loc = self.preParse(instring, loc)
+                    se = Empty() + StringEnd().set_debug(False)
+                    se._parse(instring, loc)
+            except _ParseActionIndexError as pa_exc:
+                raise pa_exc.exc
+            except ParseBaseException as exc:
+                if ParserElement.verbose_stacktrace:
+                    raise
 
-            # catch and re-raise exception from here, clearing out pyparsing internal stack trace
-            raise exc.with_traceback(None)
-        else:
-            return tokens
+                # catch and re-raise exception from here, clearing out pyparsing internal stack trace
+                raise exc.with_traceback(None)
+            else:
+                return tokens
 
     def scan_string(
         self,
@@ -1438,46 +1566,46 @@ class ParserElement(ABC):
             preparseFn = preparser.preParse
         else:
             preparseFn = self.preParse
-        parseFn = self._parse
-        ParserElement.reset_cache()
-        matches = 0
-        try:
-            while loc <= instrlen and matches < max_matches:
-                try:
-                    preloc: int = preparseFn(instring, loc)
-                    nextLoc: int
-                    tokens: ParseResults
-                    nextLoc, tokens = parseFn(instring, preloc, callPreParse=False)
-                except ParseException:
-                    loc = preloc + 1
-                else:
-                    if nextLoc > loc:
-                        matches += 1
-                        if debug:
-                            print(
-                                {
-                                    "tokens": tokens.as_list(),
-                                    "start": preloc,
-                                    "end": nextLoc,
-                                }
-                            )
-                        yield tokens, preloc, nextLoc
-                        if overlap:
-                            nextloc = preparseFn(instring, loc)
-                            if nextloc > loc:
-                                loc = nextLoc
-                            else:
-                                loc += 1
-                        else:
-                            loc = nextLoc
-                    else:
+        with ParserElement._parse_session_context():
+            parseFn = self._parse
+            matches = 0
+            try:
+                while loc <= instrlen and matches < max_matches:
+                    try:
+                        preloc: int = preparseFn(instring, loc)
+                        nextLoc: int
+                        tokens: ParseResults
+                        nextLoc, tokens = parseFn(instring, preloc, callPreParse=False)
+                    except ParseException:
                         loc = preloc + 1
-        except ParseBaseException as exc:
-            if ParserElement.verbose_stacktrace:
-                raise
+                    else:
+                        if nextLoc > loc:
+                            matches += 1
+                            if debug:
+                                print(
+                                    {
+                                        "tokens": tokens.as_list(),
+                                        "start": preloc,
+                                        "end": nextLoc,
+                                    }
+                                )
+                            yield tokens, preloc, nextLoc
+                            if overlap:
+                                nextloc = preparseFn(instring, loc)
+                                if nextloc > loc:
+                                    loc = nextLoc
+                                else:
+                                    loc += 1
+                            else:
+                                loc = nextLoc
+                        else:
+                            loc = preloc + 1
+            except ParseBaseException as exc:
+                if ParserElement.verbose_stacktrace:
+                    raise
 
-            # catch and re-raise exception from here, clears out pyparsing internal stack trace
-            raise exc.with_traceback(None)
+                # catch and re-raise exception from here, clears out pyparsing internal stack trace
+                raise exc.with_traceback(None)
 
     def transform_string(self, instring: str, *, debug: bool = False) -> str:
         """
@@ -6302,7 +6430,8 @@ class Forward(ParseElementEnhance):
                 PyparsingDiagnosticWarning,
                 stacklevel=stacklevel,
             )
-        if not ParserElement._left_recursion_enabled:
+        session = ParserElement._current_parse_session()
+        if session is None or not session.left_recursion_enabled:
             return super().parseImpl(instring, loc, do_actions)
         # ## Bounded Recursion algorithm ##
         # Recursion only needs to be processed at ``Forward`` elements, since they are
@@ -6323,8 +6452,13 @@ class Forward(ParseElementEnhance):
         # actions: We do not want to run the actions too often while expanding. Thus,
         # we expand using `do_actions=False` and only run `do_actions=True` if the next
         # recursion level is acceptable.
-        with ParserElement.recursion_lock:
-            memo = ParserElement.recursion_memos
+        memo = cast(
+            collections.abc.MutableMapping[
+                tuple[int, Forward, bool], tuple[int, Union[ParseResults, Exception]]
+            ],
+            session.recursion_memos,
+        )
+        with session.recursion_lock:
             try:
                 # we are parsing at a specific recursion expansion - use it as-is
                 prev_loc, prev_result = memo[loc, self, do_actions]
