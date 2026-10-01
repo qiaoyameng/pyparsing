@@ -280,6 +280,7 @@ __all__ = [
     "ParseException",
     "ParseExpression",
     "ParseFatalException",
+    "ParseSearchLimitException",
     "ParseResults",
     "ParseSyntaxException",
     "ParserElement",

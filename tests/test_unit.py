@@ -3804,8 +3804,8 @@ class Test02_WithoutPackrat(ppt.TestParseResultsAsserts, TestCase):
         # ParserElement & str
         with self.subTest():
             expr = pp.Word(pp.alphas)("first") + (pp.Word(pp.alphas)("second") & "and")
-            with self.assertRaisesParseException(msg="issue with ParserElement & str"):
-                result = expr.parse_string("spam and eggs", parse_all=True)
+            result = expr.parse_string("spam and eggs", parse_all=True)
+            self.assertEqual(["spam", "and", "eggs"], result.as_list())
 
         # str & ParserElement
         with self.subTest():
@@ -6687,6 +6687,93 @@ class Test02_WithoutPackrat(ppt.TestParseResultsAsserts, TestCase):
                 f"Failed RequiredEachTest, expected {res1.as_list()}"
                 f" and {res2.as_list} to contain the same words in any order",
             )
+
+    def testEachCompleteMatchFallback(self):
+        parser = pp.Word(pp.alphas)("word") & pp.Literal("and")
+
+        result = parser.parse_string("and eggs", parse_all=True)
+        self.assertEqual(["and", "eggs"], result.as_list())
+        self.assertEqual({"word": "eggs"}, result.as_dict())
+
+    def testEachCompleteMatchBothOrders(self):
+        parser = pp.Literal("a")("a") & pp.Literal("b")("b")
+
+        for text, expected in (
+            ("a b", ["a", "b"]),
+            ("b a", ["b", "a"]),
+        ):
+            with self.subTest(text=text):
+                result = parser.parse_string(text, parse_all=True)
+                self.assertEqual(expected, result.as_list())
+
+    def testEachOptionalWithCommonPrefix(self):
+        parser = pp.Opt(pp.Literal("ab")("optional")) & pp.Regex(
+            r"abc"
+        )("required")
+
+        result = parser.parse_string("abc ab", parse_all=True)
+        self.assertEqual(["abc", "ab"], result.as_list())
+        self.assertEqual({"required": "abc", "optional": "ab"}, result.as_dict())
+
+    def testEachCompleteMatchOptionalDefaults(self):
+        parser = pp.Opt(pp.Literal("a")("value"), default="d")("value") & pp.Literal(
+            "b"
+        )
+
+        result = parser.parse_string("b", parse_all=True)
+        self.assertEqual(["b", "d"], result.as_list())
+        self.assertEqual({"value": "d"}, result.as_dict())
+
+    def testEachCompleteMatchRepeatedResultsName(self):
+        parser = pp.Literal("a")("a") & pp.Literal("b")[1, ...]("b")
+
+        for text in ("a b b", "b a b", "b b a"):
+            with self.subTest(text=text):
+                result = parser.parse_string(text, parse_all=True)
+                self.assertEqual(text.split(), result.as_list())
+                self.assertEqual(["b", "b"], result.as_dict()["b"])
+
+    def testEachCompleteMatchZeroLengthRepeat(self):
+        parser = pp.Literal("a") & pp.Empty()[...]
+
+        result = parser.parse_string("a", parse_all=True)
+        self.assertEqual(["a"], result.as_list())
+
+    def testEachCompleteMatchSearchLimit(self):
+        exprs = [pp.Opt(pp.Literal("ab")), pp.Regex(r"b")]
+
+        parser = pp.Each(exprs, max_search_calls=1)
+        with self.assertRaises(pp.ParseSearchLimitException):
+            parser.parse_string("ab", parse_all=True)
+
+        parser = pp.Each(exprs)
+        with self.assertRaises(ParseException):
+            parser.parse_string("c", parse_all=True)
+
+    def testEachCompleteMatchDoesNotRunActionsDuringProbes(self):
+        calls = []
+        word = pp.Word(pp.alphas).add_parse_action(
+            lambda toks: calls.append(toks[0])
+        )
+        and_literal = pp.Literal("and").add_parse_action(
+            lambda: calls.append("and")
+        )
+        fallback_parser = word("word") & and_literal
+        result = fallback_parser.parse_string("and eggs", parse_all=True)
+        self.assertEqual(["and", "eggs"], result.as_list())
+        self.assertEqual(["and", "eggs"], calls)
+
+        calls.clear()
+        optional = pp.Literal("x").add_parse_action(
+            lambda: calls.append("x")
+        )
+        required = pp.Literal("y").add_parse_action(
+            lambda: calls.append("y")
+        )
+        legacy_parser = pp.Opt(optional("x")) & required("y")
+        result = legacy_parser.parse_string("y x", parse_all=True)
+        self.assertEqual(["y", "x"], result.as_list())
+        self.assertEqual(["y", "x"], calls)
 
     def testOptionalEachTest1(self):
         for the_input in [

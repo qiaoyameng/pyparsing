@@ -327,6 +327,19 @@ class ParseFatalException(ParseBaseException):
     """
 
 
+class ParseSearchLimitException(RuntimeError):
+    """
+    Raised when an expression's bounded search exceeds its configured limit.
+
+    This is distinct from :class:`ParseException`, which indicates that no
+    valid parse was found.
+    """
+
+    def __init__(self, message: str, parser_element: typing.Any = None) -> None:
+        super().__init__(message)
+        self.parser_element = parser_element
+
+
 class ParseSyntaxException(ParseFatalException):
     """
     Just like :class:`ParseFatalException`, but thrown internally

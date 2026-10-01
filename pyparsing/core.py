@@ -4964,11 +4964,25 @@ class MatchFirst(ParseExpression):
         return super()._setResultsName(name, list_all_matches)
 
 
+class _EachItem(NamedTuple):
+    expr: ParserElement
+    replay_expr: ParserElement
+    is_optional: bool
+    is_repeat: bool
+    max_count: typing.Optional[int]
+
+
 class Each(ParseExpression):
     """Requires all given :class:`ParserElement` s to be found, but in
     any order. Expressions may be separated by whitespace.
 
     May be constructed using the ``'&'`` operator.
+
+    :param exprs: expressions to match in any order
+    :param max_search_calls: maximum number of lookahead attempts made by
+        the fallback full-match search; exceeding this raises
+        :class:`ParseSearchLimitException` rather than
+        :class:`ParseException`
 
     Example:
 
@@ -5032,9 +5046,16 @@ class Each(ParseExpression):
     """
 
     def __init__(
-        self, exprs: typing.Iterable[ParserElement], savelist: bool = True
+        self,
+        exprs: typing.Iterable[ParserElement],
+        savelist: bool = True,
+        *,
+        max_search_calls: int = 10_000,
     ) -> None:
         super().__init__(exprs, savelist)
+        if max_search_calls <= 0:
+            raise ValueError("max_search_calls must be greater than 0")
+        self.max_search_calls = max_search_calls
         if self.exprs:
             self._may_return_empty = all(e.mayReturnEmpty for e in self.exprs)
         else:
@@ -5058,39 +5079,18 @@ class Each(ParseExpression):
             self._may_return_empty = True
         return self
 
-    def parseImpl(self, instring, loc, do_actions=True) -> ParseImplReturnType:
+    def _parseImplLegacy(
+        self, instring, loc, do_actions=True
+    ) -> ParseImplReturnType:
         if self.initExprGroups:
-            self.opt1map = dict(
-                (id(e.expr), e) for e in self.exprs if isinstance(e, Opt)
-            )
-            opt1 = [e.expr for e in self.exprs if isinstance(e, Opt)]
-            opt2 = [
-                e
-                for e in self.exprs
-                if e.mayReturnEmpty and not isinstance(e, (Opt, Regex, ZeroOrMore))
-            ]
-            self.optionals = opt1 + opt2
-            self.multioptionals = [
-                e.expr.set_results_name(e.resultsName, list_all_matches=True)
-                for e in self.exprs
-                if isinstance(e, _MultipleMatch)
-            ]
-            self.multirequired = [
-                e.expr.set_results_name(e.resultsName, list_all_matches=True)
-                for e in self.exprs
-                if isinstance(e, OneOrMore)
-            ]
-            self.required = [
-                e for e in self.exprs if not isinstance(e, (Opt, ZeroOrMore, OneOrMore))
-            ]
-            self.required += self.multirequired
-            self.initExprGroups = False
+            self._initExprGroups()
 
         tmpLoc = loc
         tmpReqd = self.required[:]
         tmpOpt = self.optionals[:]
         multis = self.multioptionals[:]
         matchOrder: list[ParserElement] = []
+        unmatched_opts = tmpOpt[:]
 
         keepMatching = True
         failed: list[ParserElement] = []
@@ -5099,9 +5099,14 @@ class Each(ParseExpression):
             tmpExprs = tmpReqd + tmpOpt + multis
             failed.clear()
             fatals.clear()
-            for e in tmpExprs:
+            matched_reqd: set[int] = set()
+            matched_opt: set[int] = set()
+            zero_width_multi: set[int] = set()
+
+            for expr_index, e in enumerate(tmpExprs):
+                previous_loc = tmpLoc
                 try:
-                    tmpLoc = e.try_parse(instring, tmpLoc, raise_fatal=True)
+                    next_loc = e.try_parse(instring, tmpLoc, raise_fatal=True)
                 except ParseFatalException as pfe:
                     pfe.__traceback__ = None
                     pfe.parser_element = e
@@ -5111,21 +5116,30 @@ class Each(ParseExpression):
                     failed.append(e)
                 else:
                     matchOrder.append(self.opt1map.get(id(e), e))
-                    if e in tmpReqd:
-                        tmpReqd.remove(e)
-                    elif e in tmpOpt:
-                        tmpOpt.remove(e)
+                    if expr_index < len(tmpReqd):
+                        matched_reqd.add(id(e))
+                    elif expr_index < len(tmpReqd) + len(tmpOpt):
+                        matched_opt.add(id(e))
+                    elif next_loc == previous_loc:
+                        zero_width_multi.add(id(e))
+                    tmpLoc = next_loc
+
+            multis = [e for e in multis if id(e) not in zero_width_multi]
+            tmpOpt = [e for e in tmpOpt if id(e) not in matched_opt]
+            unmatched_opts = [
+                e for e in unmatched_opts if id(e) not in matched_opt
+            ]
+            tmpReqd = [e for e in tmpReqd if id(e) not in matched_reqd]
+
             if len(failed) == len(tmpExprs):
                 keepMatching = False
 
-        # look for any ParseFatalExceptions
         if fatals:
             if len(fatals) > 1:
                 fatals.sort(key=lambda e: -e.loc)
                 if fatals[0].loc == fatals[1].loc:
                     fatals.sort(key=lambda e: (-e.loc, -len(str(e.parser_element))))
-            max_fatal = fatals[0]
-            raise max_fatal
+            raise fatals[0]
 
         if tmpReqd:
             missing = ", ".join([str(e) for e in tmpReqd])
@@ -5135,8 +5149,12 @@ class Each(ParseExpression):
                 f"Missing one or more required elements ({missing})",
             )
 
-        # add any unmatched Opts, in case they have default values defined
-        matchOrder += [e for e in self.exprs if isinstance(e, Opt) and e.expr in tmpOpt]
+        matchOrder += [
+            e
+            for e in self.exprs
+            if isinstance(e, Opt)
+            and any(e.expr is opt for opt in unmatched_opts)
+        ]
 
         total_results = ParseResults([])
         for e in matchOrder:
@@ -5144,6 +5162,249 @@ class Each(ParseExpression):
             total_results += results
 
         return loc, total_results
+
+    def parseImpl(self, instring, loc, do_actions=True) -> ParseImplReturnType:
+        if self.initExprGroups:
+            self._initExprGroups()
+
+        try:
+            return self._parseImplLegacy(instring, loc, do_actions)
+        except ParseSearchLimitException:
+            raise
+        except ParseFatalException:
+            raise
+        except ParseException:
+            return self._parseImplSearch(instring, loc, do_actions)
+
+    def _initExprGroups(self) -> None:
+        self.opt1map = dict((id(e.expr), e) for e in self.exprs if isinstance(e, Opt))
+        opt1 = [e.expr for e in self.exprs if isinstance(e, Opt)]
+        opt2 = [
+            e
+            for e in self.exprs
+            if e.mayReturnEmpty and not isinstance(e, (Opt, Regex, ZeroOrMore))
+        ]
+        self.optionals = opt1 + opt2
+        self.multioptionals = [
+            e.expr.set_results_name(e.resultsName, list_all_matches=True)
+            for e in self.exprs
+            if isinstance(e, _MultipleMatch)
+        ]
+        self.multirequired = [
+            e.expr.set_results_name(e.resultsName, list_all_matches=True)
+            for e in self.exprs
+            if isinstance(e, OneOrMore)
+        ]
+        self.required = [
+            e for e in self.exprs if not isinstance(e, (Opt, ZeroOrMore, OneOrMore))
+        ]
+        self.required += self.multirequired
+
+        each_items: list[_EachItem] = []
+        for expr in self.exprs:
+            if isinstance(expr, Opt):
+                each_items.append(_EachItem(expr, expr, True, False, None))
+            elif isinstance(expr, _MultipleMatch):
+                inner = expr.expr
+                if expr.resultsName:
+                    inner = inner.set_results_name(
+                        expr.resultsName, list_all_matches=True
+                    )
+                each_items.append(
+                    _EachItem(
+                        inner,
+                        inner,
+                        isinstance(expr, ZeroOrMore),
+                        True,
+                        expr.max_count,
+                    )
+                )
+            else:
+                each_items.append(
+                    _EachItem(
+                        expr,
+                        expr,
+                        False,
+                        False,
+                        None,
+                    )
+                )
+        self._each_items = tuple(each_items)
+        self.initExprGroups = False
+
+    def _parseImplSearch(
+        self, instring, loc, do_actions=True
+    ) -> ParseImplReturnType:
+        items = self._each_items
+        item_count = len(items)
+        initial_counts = (0,) * item_count
+
+        def is_complete(counts: tuple[int, ...]) -> bool:
+            return all(
+                count > 0 or item.is_optional
+                for count, item in zip(counts, items)
+            )
+
+        SearchNode = tuple[
+            int,
+            tuple[int, ...],
+            frozenset[int],
+            frozenset[int],
+            int,
+            typing.Optional[tuple[int, _EachItem, int, bool]],
+        ]
+
+        best_loc = -1
+        best_node: typing.Optional[int] = None
+        last_counts = initial_counts
+        search_calls = 0
+        seen: set[tuple[int, tuple[int, ...], frozenset[int], frozenset[int]]] = set()
+        nodes: list[SearchNode] = [
+            (loc, initial_counts, frozenset(), frozenset(), -1, None)
+        ]
+        stack = [0]
+
+        while stack:
+            node_id = stack.pop()
+            current_loc, counts, zero_width, deferred, _, _ = nodes[node_id]
+            state = (current_loc, counts, zero_width, deferred)
+            if state in seen:
+                continue
+            seen.add(state)
+            last_counts = counts
+
+            if is_complete(counts) and current_loc > best_loc:
+                best_loc = current_loc
+                best_node = node_id
+                if current_loc == len(instring):
+                    break
+
+            transitions = []
+            skip_transitions = []
+            for i, item in enumerate(items):
+                count = counts[i]
+                if i in deferred:
+                    continue
+                if not item.is_repeat:
+                    if count:
+                        continue
+                    elif item.is_optional:
+                        skip_transitions.append(
+                            (
+                                current_loc,
+                                counts,
+                                zero_width,
+                                deferred | {i},
+                                (i, item, current_loc, False),
+                            )
+                        )
+                elif i in zero_width or (
+                    item.max_count is not None and count >= item.max_count
+                ):
+                    continue
+
+                search_calls += 1
+                if search_calls > self.max_search_calls:
+                    raise ParseSearchLimitException(
+                        f"Each search limit of {self.max_search_calls} attempts exceeded",
+                        self,
+                    )
+
+                try:
+                    next_loc = item.expr.try_parse(
+                        instring, current_loc, raise_fatal=True
+                    )
+                except ParseFatalException:
+                    raise
+                except (ParseException, IndexError):
+                    continue
+
+                next_counts_list = list(counts)
+                next_counts_list[i] = count + 1
+                next_counts = tuple(next_counts_list)
+
+                next_deferred = (
+                    frozenset() if next_loc != current_loc else deferred
+                )
+
+                if item.is_repeat and next_loc == current_loc:
+                    next_zero_width = zero_width | {i}
+                elif item.is_repeat:
+                    next_zero_width = frozenset()
+                else:
+                    next_zero_width = zero_width
+
+                event = (i, item, next_loc, True)
+                transitions.append(
+                    (next_loc, next_counts, next_zero_width, next_deferred, event)
+                )
+
+            for transition in reversed(
+                transitions + skip_transitions
+            ):
+                (
+                    next_loc,
+                    next_counts,
+                    next_zero_width,
+                    next_deferred,
+                    event,
+                ) = transition
+                next_node_id = len(nodes)
+                nodes.append(
+                    (
+                        next_loc,
+                        next_counts,
+                        next_zero_width,
+                        next_deferred,
+                        node_id,
+                        event,
+                    )
+                )
+                stack.append(next_node_id)
+
+        if best_node is None:
+            missing = ", ".join(
+                str(item.replay_expr)
+                for i, item in enumerate(items)
+                if not last_counts[i] and not item.is_optional
+            )
+            raise ParseException(
+                instring,
+                loc,
+                f"Missing one or more required elements ({missing})",
+                self,
+            )
+
+        best_path: list[tuple[int, _EachItem, int, bool]] = []
+        node_id = best_node
+        while node_id > 0:
+            _, _, _, _, parent_id, event = nodes[node_id]
+            if event is not None:
+                best_path.append(event)
+            node_id = parent_id
+        best_path.reverse()
+
+        total_results = ParseResults([])
+        replay_loc = loc
+        for _, item, _, matched in best_path:
+            if not matched:
+                continue
+            replay_loc, results = item.replay_expr._parse(
+                instring, replay_loc, do_actions
+            )
+            total_results += results
+
+        matched_items = {
+            index for index, _, _, matched in best_path if matched
+        }
+        for index, item in enumerate(items):
+            if isinstance(item.replay_expr, Opt) and index not in matched_items:
+                replay_loc, results = item.replay_expr._parse(
+                    instring, replay_loc, do_actions
+                )
+                total_results += results
+
+        return best_loc, total_results
 
     def _generateDefaultName(self) -> str:
         return f"{{{' & '.join(str(e) for e in self.exprs)}}}"
