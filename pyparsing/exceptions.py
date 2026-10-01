@@ -336,6 +336,20 @@ class ParseSyntaxException(ParseFatalException):
     """
 
 
+class ParseEachSearchLimitException(ParseFatalException):
+    """
+    Thrown by :class:`Each` when its exhaustive "any-order" matching search
+    exceeds its configured search budget without finding a complete match.
+
+    This is distinct from :class:`ParseException` (which indicates that the
+    input simply does not match the grammar): the input *may* be valid, but
+    the number of candidate match orderings explored while trying to satisfy
+    all of the required elements grew too large. The per-:class:`Each`
+    budget may be raised by assigning a larger value to
+    ``Each.max_search_count``.
+    """
+
+
 class RecursiveGrammarException(Exception):
     """
     .. deprecated:: 3.0.0

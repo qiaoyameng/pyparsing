@@ -4970,6 +4970,23 @@ class Each(ParseExpression):
 
     May be constructed using the ``'&'`` operator.
 
+    Matching first uses the historical greedy strategy: at each position the
+    first matching expression (required, then optional, then repeating) is
+    taken. If that ordering leaves a required element unsatisfied, ``Each``
+    falls back to a complete-match search over ``(position, remaining items)``
+    that accepts only orderings satisfying *every* required element, then
+    disambiguates among them (most input consumed, then most positive
+    matches). This lets an optional expression sharing a prefix with a later
+    required expression defer instead of stealing the required text.
+
+    Candidate expressions are probed with parse actions disabled, so
+    backtracking through tentative orderings never invokes side-effecting
+    parse actions; they run exactly once when the winning ordering is
+    replayed. The search is bounded by :attr:`max_search_count`; exceeding it
+    raises :class:`ParseEachSearchLimitException`, which is distinct from an
+    ordinary non-match. Zero-length matches are taken at most once per
+    position so that empty-matching expressions cannot loop forever.
+
     Example:
 
     .. testcode::
@@ -5058,6 +5075,12 @@ class Each(ParseExpression):
             self._may_return_empty = True
         return self
 
+    #: Maximum number of candidate states the any-order matching search may
+    #: visit before giving up. May be overridden on an Each instance or
+    #: subclass. Exceeding this limit raises
+    #: ParseEachSearchLimitException, distinct from an ordinary non-match.
+    max_search_count = 10_000
+
     def parseImpl(self, instring, loc, do_actions=True) -> ParseImplReturnType:
         if self.initExprGroups:
             self.opt1map = dict(
@@ -5086,37 +5109,78 @@ class Each(ParseExpression):
             self.required += self.multirequired
             self.initExprGroups = False
 
+        fatals: list[ParseFatalException] = []
+
+        # Historical greedy, "first match wins" pass: at each input position
+        # try required, then optional, then repeating expressions and take the
+        # first one that matches. This ordering is fast and almost always
+        # finds a valid permutation, and keeps behavior compatible with
+        # prior pyparsing versions.
         tmpLoc = loc
         tmpReqd = self.required[:]
         tmpOpt = self.optionals[:]
         multis = self.multioptionals[:]
+        multi_ids = {id(e) for e in multis}
         matchOrder: list[ParserElement] = []
+        # A repeating element is attempted at most once at each position;
+        # this also stops zero-length matches such as ZeroOrMore(Empty) from
+        # being retried forever.
+        multi_tried_locs: set[tuple[int, int]] = set()
 
         keepMatching = True
-        failed: list[ParserElement] = []
-        fatals: list[ParseFatalException] = []
         while keepMatching:
             tmpExprs = tmpReqd + tmpOpt + multis
-            failed.clear()
-            fatals.clear()
+            locBeforePass = tmpLoc
             for e in tmpExprs:
+                e_id = id(e)
+                if e_id in multi_ids:
+                    if (e_id, tmpLoc) in multi_tried_locs:
+                        continue
+                    multi_tried_locs.add((e_id, tmpLoc))
                 try:
-                    tmpLoc = e.try_parse(instring, tmpLoc, raise_fatal=True)
+                    newLoc = e.try_parse(instring, tmpLoc, raise_fatal=True)
                 except ParseFatalException as pfe:
                     pfe.__traceback__ = None
                     pfe.parser_element = e
                     fatals.append(pfe)
-                    failed.append(e)
                 except ParseException:
-                    failed.append(e)
+                    pass
                 else:
+                    if newLoc == tmpLoc and e_id in multi_ids:
+                        # zero-length repeat match: leave it available for a
+                        # later position but do not advance
+                        continue
+                    if newLoc == tmpLoc and not e.mayReturnEmpty:
+                        # a zero-length outcome after whitespace skipping is
+                        # not a real match for an element that cannot match
+                        # empty
+                        continue
                     matchOrder.append(self.opt1map.get(id(e), e))
                     if e in tmpReqd:
+                        # a OneOrMore-derived required probe is satisfied by
+                        # this (positive) match; further copies come from
+                        # multis, so remove it as a one-shot requirement
                         tmpReqd.remove(e)
                     elif e in tmpOpt:
                         tmpOpt.remove(e)
-            if len(failed) == len(tmpExprs):
+                    tmpLoc = newLoc
+            # stop once a whole pass consumed no input
+            if tmpLoc == locBeforePass:
                 keepMatching = False
+
+        if tmpReqd and not fatals:
+            # Greedy ordering left one or more required elements unsatisfied.
+            # Fall back to an exhaustive search over (position, remaining
+            # items) that only accepts an ordering satisfying every required
+            # element, then disambiguates among the survivors.
+            fallback = self._searchCompleteMatch(instring, loc, fatals)
+            if fallback is not None:
+                tmpLoc, matchOrder, search_opt_ids = fallback
+                tmpReqd = []
+            else:
+                search_opt_ids = set()
+        else:
+            search_opt_ids = set()
 
         # look for any ParseFatalExceptions
         if fatals:
@@ -5136,7 +5200,14 @@ class Each(ParseExpression):
             )
 
         # add any unmatched Opts, in case they have default values defined
-        matchOrder += [e for e in self.exprs if isinstance(e, Opt) and e.expr in tmpOpt]
+        matched_opt_ids = {id(e) for e in matchOrder if isinstance(e, Opt)}
+        for e in self.exprs:
+            if (
+                isinstance(e, Opt)
+                and id(e) not in matched_opt_ids
+                and id(e) not in search_opt_ids
+            ):
+                matchOrder.append(e)
 
         total_results = ParseResults([])
         for e in matchOrder:
@@ -5144,6 +5215,328 @@ class Each(ParseExpression):
             total_results += results
 
         return loc, total_results
+
+    def _searchCompleteMatch(
+        self,
+        instring: str,
+        loc: int,
+        fatals: list[ParseFatalException],
+    ) -> typing.Optional[
+        tuple[int, list[ParserElement], set[int]]
+    ]:
+        """Search any-order permutations, keyed by current input position and
+        by the set of outstanding items.
+
+        Returns ``(end_loc, match_order, managed_opt_ids)`` for an ordering
+        that satisfies every required element (favoring the ordering that
+        consumes the most input, then the greatest number of positive
+        matches), or ``None`` when no such ordering exists.
+
+        Every candidate is probed with :meth:`try_parse` and
+        ``do_actions=False``; parse actions and other side-effecting
+        callbacks therefore never run while tentatively exploring
+        alternatives, and run exactly once during the final replay. Each
+        positive match of a repeating expression is appended to the path
+        individually so interleaved chunks are replayed exactly where they
+        matched. The search is bounded by :attr:`max_search_count`; exceeding
+        that budget raises :class:`ParseEachSearchLimitException`, distinct
+        from an ordinary non-match.
+        """
+        # Classify the declared sub-expressions as required singles, optional
+        # singles, or repeating expressions (a OneOrMore repeat must make at
+        # least one positive, position-advancing match).
+        required_items: list[tuple[ParserElement, ParserElement]] = []
+        optional_items: list[tuple[ParserElement, ParserElement]] = []
+        # (probe, replay, must_match)
+        repeating_items: list[tuple[ParserElement, ParserElement, bool]] = []
+
+        for e in self.exprs:
+            if isinstance(e, Opt) and isinstance(e.expr, _MultipleMatch):
+                # an Opt wrapping a repetition is an optional repetition;
+                # probe/replay its inner element as a named list-all match,
+                # yielding nothing when nothing matched
+                inner = e.expr
+                probe = inner.expr.set_results_name(
+                    e.resultsName, list_all_matches=True
+                )
+                repeating_items.append((probe, probe, False))
+            elif isinstance(e, _MultipleMatch):
+                repeating_items.append(
+                    (e.expr, e.expr, isinstance(e, OneOrMore))
+                )
+            elif isinstance(e, Opt):
+                optional_items.append((e.expr, e))
+            elif e.mayReturnEmpty:
+                optional_items.append((e, e))
+            else:
+                required_items.append((e, e))
+
+        n_req = len(required_items)
+        n_opt = len(optional_items)
+        n_rep = len(repeating_items)
+        probes = required_items + optional_items + repeating_items
+
+        # Opts wrapping a repetition are replayed chunk-by-chunk here; their
+        # wrappers must not be appended again for default-value handling
+        managed_opt_ids = {
+            id(e)
+            for e in self.exprs
+            if isinstance(e, Opt) and isinstance(e.expr, _MultipleMatch)
+        }
+
+        full_req_mask = (1 << n_req) - 1
+        required_rep_mask = 0
+        for k, (_, _, must_match) in enumerate(repeating_items):
+            if must_match:
+                required_rep_mask |= 1 << k
+
+        search_count = 0
+        limit = self.max_search_count
+
+        def probe_at(idx: int, cur_loc: int) -> int:
+            probe = probes[idx][0]
+            try:
+                return probe.try_parse(instring, cur_loc, raise_fatal=True)
+            except ParseFatalException as pfe:
+                pfe.__traceback__ = None
+                pfe.parser_element = probe
+                fatals.append(pfe)
+                raise
+            except ParseException:
+                return -1
+
+        # Build the list of successor states for a given state. A state is
+        # (cur_loc, req_mask, opt_mask, opt_zero_mask, rep_tried_mask,
+        #  rep_positive_mask, path). Iterative DFS avoids Python recursion
+        # limits on long match paths.
+        SearchState = tuple[
+            int, int, int, int, int, int, list[ParserElement]
+        ]
+
+        def successors(state: SearchState) -> list[SearchState]:
+            (
+                cur_loc,
+                req_mask,
+                opt_mask,
+                opt_zero_mask,
+                rep_tried_mask,
+                rep_positive_mask,
+                path,
+            ) = state
+            next_states: list[SearchState] = []
+
+            for idx in range(n_req + n_opt + n_rep):
+                if idx < n_req:
+                    if req_mask & (1 << idx):
+                        continue
+                elif idx < n_req + n_opt:
+                    opt_idx = idx - n_req
+                    if opt_mask & (1 << opt_idx):
+                        continue
+                    if opt_zero_mask & (1 << opt_idx):
+                        continue
+                else:
+                    rep_idx = idx - n_req - n_opt
+                    if rep_tried_mask & (1 << rep_idx):
+                        continue
+
+                new_loc = probe_at(idx, cur_loc)
+                if new_loc == -1:
+                    continue
+
+                if idx < n_req:
+                    replay = probes[idx][1]
+                    if new_loc == cur_loc:
+                        # only an element that genuinely matches empty may
+                        # satisfy a required slot in place
+                        if not probes[idx][0].mayReturnEmpty:
+                            continue
+                        next_states.append(
+                            (
+                                cur_loc,
+                                req_mask | (1 << idx),
+                                opt_mask,
+                                opt_zero_mask,
+                                rep_tried_mask,
+                                rep_positive_mask,
+                                path,
+                            )
+                        )
+                    else:
+                        next_states.append(
+                            (
+                                new_loc,
+                                req_mask | (1 << idx),
+                                opt_mask,
+                                0,
+                                0,
+                                rep_positive_mask,
+                                path + [replay],
+                            )
+                        )
+
+                elif idx < n_req + n_opt:
+                    opt_idx = idx - n_req
+                    replay = probes[idx][1]
+                    if new_loc == cur_loc:
+                        # zero-length optional: mark zero-tried here so other
+                        # expressions can advance; it becomes eligible again
+                        # once the position moves
+                        next_states.append(
+                            (
+                                cur_loc,
+                                req_mask,
+                                opt_mask,
+                                opt_zero_mask | (1 << opt_idx),
+                                rep_tried_mask,
+                                rep_positive_mask,
+                                path,
+                            )
+                        )
+                        # ... or permanently leave this optional unmatched
+                        next_states.append(
+                            (
+                                cur_loc,
+                                req_mask,
+                                opt_mask | (1 << opt_idx),
+                                opt_zero_mask,
+                                rep_tried_mask,
+                                rep_positive_mask,
+                                path,
+                            )
+                        )
+                    else:
+                        # take the optional now
+                        next_states.append(
+                            (
+                                new_loc,
+                                req_mask,
+                                opt_mask | (1 << opt_idx),
+                                0,
+                                0,
+                                rep_positive_mask,
+                                path + [replay],
+                            )
+                        )
+                        # ... or defer it so a later required expression can
+                        # take the text at this position
+                        next_states.append(
+                            (
+                                cur_loc,
+                                req_mask,
+                                opt_mask,
+                                opt_zero_mask,
+                                rep_tried_mask,
+                                rep_positive_mask,
+                                path,
+                            )
+                        )
+
+                else:
+                    rep_idx = idx - n_req - n_opt
+                    replay = probes[idx][1]
+                    if new_loc == cur_loc:
+                        # zero-length repeat: try it only once at this
+                        # position, and never count it as a positive match
+                        next_states.append(
+                            (
+                                cur_loc,
+                                req_mask,
+                                opt_mask,
+                                opt_zero_mask,
+                                rep_tried_mask | (1 << rep_idx),
+                                rep_positive_mask,
+                                path,
+                            )
+                        )
+                    else:
+                        # take another positive repetition
+                        next_states.append(
+                            (
+                                new_loc,
+                                req_mask,
+                                opt_mask,
+                                0,
+                                0,
+                                rep_positive_mask | (1 << rep_idx),
+                                path + [replay],
+                            )
+                        )
+                        # ... or stop repeating this item at cur_loc
+                        next_states.append(
+                            (
+                                cur_loc,
+                                req_mask,
+                                opt_mask,
+                                opt_zero_mask,
+                                rep_tried_mask | (1 << rep_idx),
+                                rep_positive_mask,
+                                path,
+                            )
+                        )
+
+            return next_states
+
+        # Iterative DFS. Each stack entry is a state whose successors still
+        # need to be explored. Keep the best complete completion found.
+        seen: set[SearchState] = set()
+        stack: list[SearchState] = [(loc, 0, 0, 0, 0, 0, [])]
+        best: typing.Optional[tuple[int, list[ParserElement]]] = None
+
+        while stack:
+            state = stack.pop()
+            (
+                cur_loc,
+                req_mask,
+                opt_mask,
+                opt_zero_mask,
+                rep_tried_mask,
+                rep_positive_mask,
+                path,
+            ) = state
+
+            search_count += 1
+            if search_count > limit:
+                raise ParseEachSearchLimitException(
+                    instring,
+                    cur_loc,
+                    "Each any-order search exceeded max_search_count "
+                    f"({limit}); raise Each.max_search_count for this grammar",
+                    self,
+                )
+
+            # memoize on everything except the accumulated path
+            memo_key = (
+                cur_loc,
+                req_mask,
+                opt_mask,
+                opt_zero_mask,
+                rep_tried_mask,
+                rep_positive_mask,
+            )
+            if memo_key in seen:
+                continue
+            seen.add(memo_key)
+
+            stack.extend(successors(state))
+
+            # a state with no successors is a terminal; accept it when every
+            # required single and every required repetition was satisfied
+            if (
+                req_mask == full_req_mask
+                and (rep_positive_mask & required_rep_mask)
+                == required_rep_mask
+            ):
+                if (
+                    best is None
+                    or cur_loc > best[0]
+                    or (cur_loc == best[0] and len(path) > len(best[1]))
+                ):
+                    best = (cur_loc, path)
+
+        if best is None:
+            return None
+        return best[0], best[1], managed_opt_ids
 
     def _generateDefaultName(self) -> str:
         return f"{{{' & '.join(str(e) for e in self.exprs)}}}"
@@ -5728,7 +6121,12 @@ class _MultipleMatch(ParseElementEnhance):
                     preloc = self_skip_ignorables(instring, loc)
                 else:
                     preloc = loc
+                pre_loc = loc
                 loc, tmptokens = self_expr_parse(instring, preloc, do_actions)
+                if loc == pre_loc:
+                    # a zero-length match cannot be repeated without looping
+                    # forever; one empty match is allowed, then stop
+                    break
                 tokens += tmptokens
                 match_count += 1
         except (ParseException, IndexError):

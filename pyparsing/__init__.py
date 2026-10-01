@@ -277,6 +277,7 @@ __all__ = [
     "Or",
     "ParseBaseException",
     "ParseElementEnhance",
+    "ParseEachSearchLimitException",
     "ParseException",
     "ParseExpression",
     "ParseFatalException",

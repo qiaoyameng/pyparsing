@@ -29,6 +29,22 @@ Version 3.3.3 - in development
 ------------------------------
 - Added support for Python 3.15.
 
+- Added a complete-match mode to `Each` (`'&'` operator). `Each` retains its
+  historical greedy matching, but when greedy ordering leaves a required
+  element unsatisfied it now falls back to a bounded search over current
+  position and remaining items that only accepts orderings satisfying every
+  required element, then disambiguates among them (most input consumed, then
+  most positive matches). This prevents an earlier optional expression that
+  shares a prefix with a later required expression from stealing the text the
+  required expression needs. Optional default values, results names, and
+  `OneOrMore`/`ZeroOrMore` repetitions (including repetitions wrapped in
+  `Opt`) are preserved, zero-length matches are taken at most once per
+  position to avoid infinite loops, and candidate probing never invokes
+  side-effecting parse actions (they run once when the winning ordering is
+  replayed). The search is bounded by the new `Each.max_search_count` class
+  attribute; exceeding it raises the new
+  `ParseEachSearchLimitException`, distinct from an ordinary non-match.
+
 - Parse actions that return a tuple value for a named expression formerly saved
   just the first value of the tuple. Now they return the entire tuple. Partially
   fixes Issue #401, PR #640 submitted by Vincent Gao et AI.

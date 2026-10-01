@@ -3804,8 +3804,15 @@ class Test02_WithoutPackrat(ppt.TestParseResultsAsserts, TestCase):
         # ParserElement & str
         with self.subTest():
             expr = pp.Word(pp.alphas)("first") + (pp.Word(pp.alphas)("second") & "and")
-            with self.assertRaisesParseException(msg="issue with ParserElement & str"):
-                result = expr.parse_string("spam and eggs", parse_all=True)
+            # the complete-match search for Each now finds the ordering in
+            # which the literal "and" is taken first and Word matches "eggs"
+            result = expr.parse_string("spam and eggs", parse_all=True)
+            self.assertParseResultsEquals(
+                result,
+                expected_list=["spam", "and", "eggs"],
+                expected_dict={"first": "spam", "second": "eggs"},
+                msg="issue with ParserElement & str",
+            )
 
         # str & ParserElement
         with self.subTest():
@@ -6848,6 +6855,144 @@ class Test02_WithoutPackrat(ppt.TestParseResultsAsserts, TestCase):
             ]:
                 result = spec.parse_string(test, parse_all=True)
                 self.assertParseResultsEquals(result, expected_dict=expected_dict)
+
+    def testEachCompleteMatchCommonPrefixBothOrders(self):
+        # When sub-expressions share a prefix, the complete-match search must
+        # find a permutation that satisfies every required element - in both
+        # orders. Here an optional "a b" must not steal the "a" needed by the
+        # required "a c" (and vice versa).
+        optional_part = pp.Opt(pp.Literal("a") + "b")("ab")
+        required_part = (pp.Literal("a") + "c")("ac")
+        grammar = optional_part & required_part
+
+        self.assertParseResultsEquals(
+            grammar.parse_string("a c", parse_all=True),
+            expected_list=["a", "c"],
+            expected_dict={"ac": ["a", "c"]},
+        )
+        self.assertParseResultsEquals(
+            grammar.parse_string("a b a c", parse_all=True),
+            expected_list=["a", "b", "a", "c"],
+            expected_dict={"ab": ["a", "b"], "ac": ["a", "c"]},
+        )
+
+        # the same grammar with the terms declared in the opposite order
+        reversed_grammar = required_part & optional_part
+        self.assertParseResultsEquals(
+            reversed_grammar.parse_string("a c", parse_all=True),
+            expected_list=["a", "c"],
+            expected_dict={"ac": ["a", "c"]},
+        )
+
+    def testEachCompleteMatchOnlyFallbackSucceeds(self):
+        # greedy, first-match ordering fails, but the fallback complete-match
+        # search succeeds
+        grammar = (pp.Literal("a") | pp.Empty()) & (pp.Literal("a") + "b")
+        self.assertParseAndCheckList(
+            grammar,
+            "a b",
+            ["a", "b"],
+            "fallback complete-match should satisfy the required element",
+        )
+
+        # a Regex that may return empty must not consume the text the
+        # required element needs
+        grammar2 = pp.Regex(r"x?") & pp.Literal("x")
+        self.assertParseAndCheckList(
+            grammar2, "x", ["x"], "empty-capable Regex must defer to required"
+        )
+
+    def testEachCompleteMatchOptionalDefaultAndNames(self):
+        # unmatched Opt keeps its default value and named results line up
+        grammar = (
+            pp.Opt("foo", default="DEF")("one")
+            & pp.Opt("bar")("two")
+            & pp.Literal("a")("a")
+        )
+        result = grammar.parse_string("bar a", parse_all=True)
+        self.assertEqual(result["one"], "DEF")
+        self.assertEqual(result["two"], "bar")
+        self.assertEqual(result["a"], "a")
+
+        # named optional results are not mis-assigned under backtracking
+        result2 = (
+            pp.Opt(pp.Literal("a") + "b")("first")
+            & (pp.Literal("a") + "c")("second")
+        ).parse_string("a c", parse_all=True)
+        self.assertNotIn("first", result2)
+        self.assertEqual(result2["second"].as_list(), ["a", "c"])
+
+    def testEachCompleteMatchZeroLengthDoesNotLoop(self):
+        # zero-length matches must terminate rather than looping forever
+        result = (
+            pp.Literal("a") & pp.ZeroOrMore(pp.Empty())("z")
+        ).parse_string("a", parse_all=True)
+        self.assertEqual(result.as_list(), ["a"])
+
+        with self.assertRaisesParseException():
+            # OneOrMore of an empty-matching element cannot make the required
+            # positive match, so this must be a clean non-match, not a loop
+            (
+                pp.OneOrMore(pp.Empty()) & pp.Literal("a")
+            ).parse_string("a", parse_all=True)
+
+    def testEachCompleteMatchSearchLimit(self):
+        grammar = (pp.Literal("a") | pp.Empty()) & (pp.Literal("a") + "b")
+        grammar.max_search_count = 1
+        with self.assertRaises(pp.ParseEachSearchLimitException):
+            grammar.parse_string("a b", parse_all=True)
+
+        # the limit exception is distinct from an ordinary non-match
+        with self.assertRaises(pp.ParseException):
+            (
+                pp.Literal("a") & pp.Literal("b")
+            ).parse_string("c", parse_all=True)
+
+        # the default limit is generous enough for normal grammars
+        self.assertIsInstance(pp.Each.max_search_count, int)
+        self.assertGreater(pp.Each.max_search_count, 2)
+
+    def testEachCompleteMatchLongFallback(self):
+        # a long any-order match resolved through the fallback search must
+        # terminate without recursion errors; a large grammar may raise its
+        # own search limit, so grant enough budget for this linear case
+        grammar = (
+            pp.Opt(pp.ZeroOrMore(pp.Literal("a")))("as")
+            & (pp.Literal("a") + "b")("ab")
+        )
+        grammar.max_search_count = 1_000_000
+        n = 2000
+        result = grammar.parse_string("a " * n + "a b", parse_all=True)
+        self.assertEqual(len(result), n + 2)
+        self.assertEqual(result["ab"].as_list(), ["a", "b"])
+
+    def testEachCompleteMatchNoSideEffectsFromProbes(self):
+        # candidate probing during backtracking must not invoke parse actions;
+        # they run exactly once when the winning ordering is replayed
+        calls = []
+        stealer = (pp.Literal("a") + "b").set_parse_action(
+            lambda s, loc, toks: calls.append(("optional", loc))
+        )
+        needer = (pp.Literal("a") + "c").set_parse_action(
+            lambda s, loc, toks: calls.append(("required", loc))
+        )
+        (pp.Opt(stealer) & needer).parse_string("a c", parse_all=True)
+        self.assertEqual(calls, [("required", 0)])
+
+        # actions fire for every real token when both orders are accepted
+        a = pp.Literal("a").set_parse_action(
+            lambda s, loc, toks: calls.append(("a", loc))
+        )
+        b = pp.Literal("b").set_parse_action(
+            lambda s, loc, toks: calls.append(("b", loc))
+        )
+        both = a("x") & b("y")
+        calls.clear()
+        both.parse_string("a b", parse_all=True)
+        self.assertEqual(calls, [("a", 0), ("b", 2)])
+        calls.clear()
+        both.parse_string("b a", parse_all=True)
+        self.assertEqual(calls, [("b", 0), ("a", 2)])
 
     def testSumParseResults(self):
         samplestr1 = "garbage;DOB 10-10-2010;more garbage\nID PARI12345678;more garbage"
