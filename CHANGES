@@ -27,6 +27,12 @@ Required Python versions by pyparsing version
 
 Version 3.3.3 - in development
 ------------------------------
+- Added `ParserElement.validate_grammar()` and `validate_grammar()` to report
+  left recursion, input-guarded recursion, and no-progress recursive loops
+  before parsing. Diagnostics include the chain of `ParserElement` names,
+  analyze optional, zero-repetition, lookahead, stop, and ignore expressions,
+  and report custom elements as unknown instead of assuming they are unsafe.
+
 - Added support for Python 3.15.
 
 - Parse actions that return a tuple value for a named expression formerly saved

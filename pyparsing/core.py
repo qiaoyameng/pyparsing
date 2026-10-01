@@ -18,6 +18,7 @@ from typing import (
     cast,
 )
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from enum import Enum
 import string
 import copy
@@ -157,6 +158,746 @@ class Diagnostics(Enum):
     warn_on_multiple_string_args_to_oneof = 5
     warn_on_match_first_with_lshift_operator = 6
     enable_debug_on_named_expressions = 7
+
+
+class GrammarRecursionKind(Enum):
+    left_recursion = "left recursion"
+    terminating_recursion = "terminating recursion"
+    no_progress_loop = "no-progress loop"
+    unknown_recursion = "unknown recursion"
+
+
+@dataclass(frozen=True)
+class GrammarRecursion:
+    kind: GrammarRecursionKind
+    elements: tuple[ParserElement, ...]
+    nullable: bool = False
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        return tuple(str(element) for element in self.elements)
+
+
+@dataclass(frozen=True)
+class GrammarValidationReport:
+    valid: bool
+    complete: bool
+    recursions: tuple[GrammarRecursion, ...] = field(default_factory=tuple)
+    unknown_elements: tuple[ParserElement, ...] = field(default_factory=tuple)
+
+
+class GrammarValidationError(ValueError):
+    """Base exception raised for grammar structures that may recurse forever."""
+
+    def __init__(self, report: GrammarValidationReport) -> None:
+        self.report = report
+        super().__init__(self._make_message(report))
+
+    @staticmethod
+    def _make_message(report: GrammarValidationReport) -> str:
+        errors = [
+            recursion
+            for recursion in report.recursions
+            if recursion.kind
+            in (
+                GrammarRecursionKind.left_recursion,
+                GrammarRecursionKind.no_progress_loop,
+            )
+        ]
+        messages = [
+            f"{recursion.kind.value}: {' -> '.join(recursion.names)}"
+            for recursion in errors
+        ]
+        return "; ".join(messages)
+
+
+class LeftRecursionError(GrammarValidationError):
+    """Raised when left recursion is detected while it is not enabled."""
+
+
+class NoProgressLoopError(GrammarValidationError):
+    """Raised when a recursive path can consume no input before recursing."""
+
+
+def validate_grammar(
+    grammar: ParserElement,
+    *,
+    left_recursion: typing.Optional[bool] = None,
+) -> GrammarValidationReport:
+    """
+    Statically validate a grammar for problematic recursive paths.
+
+    The analysis follows ordinary subexpressions, zero-width lookaheads,
+    repetition stop expressions, and ignored expressions. It distinguishes
+    left recursion, input-guarded recursion, no-progress loops, and recursion
+    involving custom elements whose behavior is not statically known.
+
+    Invalid reports also raise either :class:`LeftRecursionError` or
+    :class:`NoProgressLoopError`.
+
+    Example:
+
+    .. testcode::
+
+        import pyparsing as pp
+
+        # A direct zero-width loop never makes progress.
+        loop = pp.Forward().set_name("loop")
+        loop <<= loop
+        try:
+            pp.validate_grammar(loop)
+        except pp.NoProgressLoopError as exc:
+            print(exc)
+
+        # Classic arithmetic is left recursive and valid when bounded
+        # recursion is enabled.
+        number = pp.Word(pp.nums).set_name("number")
+        expression = pp.Forward().set_name("expression")
+        expression <<= (expression + "+" + number) | number
+        report = pp.validate_grammar(expression, left_recursion=True)
+        print(report.valid, report.recursions[0].kind.name)
+
+        # Consuming input before the recursive call terminates the recursion.
+        right = pp.Forward().set_name("right")
+        right <<= pp.Literal("x") + right | pp.Empty()
+        report = pp.validate_grammar(right)
+        print(report.recursions[0].kind.name)
+
+    .. testoutput::
+
+        no-progress loop: loop -> loop
+        True left_recursion
+        terminating_recursion
+    """
+    analyzer = _GrammarValidator(
+        grammar,
+        ParserElement._left_recursion_enabled
+        if left_recursion is None
+        else left_recursion,
+    )
+    return analyzer.validate()
+
+
+class _GrammarValidator:
+    _FALSE = 0
+    _UNKNOWN = 1
+    _TRUE = 2
+
+    _KNOWN_LEAF_NAMES = {
+        "Empty",
+        "Literal",
+        "_SingleCharLiteral",
+        "Keyword",
+        "CaselessKeyword",
+        "CaselessLiteral",
+        "CloseMatch",
+        "Word",
+        "CharsNotIn",
+        "QuotedString",
+        "PositionToken",
+        "GoToColumn",
+        "LineStart",
+        "LineEnd",
+        "StringStart",
+        "StringEnd",
+        "WordStart",
+        "WordEnd",
+        "Tag",
+    }
+    _ALWAYS_NULLABLE_LEAF_NAMES = {
+        "Empty",
+        "PositionToken",
+        "GoToColumn",
+        "LineStart",
+        "LineEnd",
+        "StringStart",
+        "StringEnd",
+        "WordStart",
+        "WordEnd",
+        "Tag",
+    }
+    _NEVER_NULLABLE_LEAF_NAMES = {
+        "_SingleCharLiteral",
+        "Literal",
+        "Keyword",
+        "CaselessKeyword",
+        "CaselessLiteral",
+        "CloseMatch",
+        "Word",
+        "CharsNotIn",
+        "QuotedString",
+    }
+
+    def __init__(self, grammar: ParserElement, left_recursion_enabled: bool) -> None:
+        self.grammar = grammar
+        self.left_recursion_enabled = left_recursion_enabled
+        self.nodes: dict[int, ParserElement] = {}
+        self.edges: dict[int, list[tuple[int, bool, bool, str]]] = {}
+        self.nullable: dict[int, int] = {}
+        self.unknown_elements: list[ParserElement] = []
+
+    def validate(self) -> GrammarValidationReport:
+        self._collect()
+        self._infer_nullability()
+        self._resolve_edge_nullability()
+        recursions = self._find_recursions()
+        complete = not self.unknown_elements and all(
+            self.nullable[node_id] != self._UNKNOWN for node_id in self.nodes
+        )
+        errors = [
+            recursion
+            for recursion in recursions
+            if recursion.kind is GrammarRecursionKind.no_progress_loop
+            or (
+                recursion.kind is GrammarRecursionKind.left_recursion
+                and not self.left_recursion_enabled
+            )
+        ]
+        report = GrammarValidationReport(
+            valid=not errors,
+            complete=complete,
+            recursions=tuple(recursions),
+            unknown_elements=tuple(self.unknown_elements),
+        )
+        if any(
+            recursion.kind is GrammarRecursionKind.no_progress_loop
+            for recursion in errors
+        ):
+            raise NoProgressLoopError(report)
+        if errors:
+            raise LeftRecursionError(report)
+        return report
+
+    def _resolve_edge_nullability(self) -> None:
+        resolved: dict[int, list[tuple[int, bool, bool, str]]] = {}
+        for node_id, outgoing in self.edges.items():
+            element = self.nodes[node_id]
+            prefixes: dict[int, bool] = {}
+            if isinstance(element, And):
+                prefix = True
+                for child in element.exprs:
+                    prefixes[id(child)] = prefix
+                    prefix = prefix and self.nullable[id(child)] == self._TRUE
+
+            resolved_outgoing: list[tuple[int, bool, bool, str]] = []
+            for child_id, nullable_prefix, guarded, edge_kind in outgoing:
+                if edge_kind == "and":
+                    nullable_prefix = prefixes.get(child_id, True)
+                elif edge_kind == "ignore":
+                    nullable_prefix = self.nullable[child_id] == self._TRUE
+                    if self.nullable[child_id] == self._UNKNOWN:
+                        nullable_prefix = False
+                        edge_kind = "unknown"
+                    elif self.nullable[child_id] == self._FALSE:
+                        nullable_prefix = False
+                        guarded = True
+                        edge_kind = "guarded"
+                resolved_outgoing.append(
+                    (child_id, nullable_prefix, guarded, edge_kind)
+                )
+            resolved[node_id] = resolved_outgoing
+        self.edges = resolved
+
+    def _collect(self) -> None:
+        pending = [self.grammar]
+        while pending:
+            element = pending.pop()
+            element_id = id(element)
+            if element_id in self.nodes:
+                continue
+            self.nodes[element_id] = element
+            self.nullable[element_id] = self._initial_nullable(element)
+            outgoing: list[tuple[int, bool, bool, str]] = []
+            self.edges[element_id] = outgoing
+
+            for child, nullable_prefix, guarded, edge_kind in self._child_specs(element):
+                child_id = id(child)
+                outgoing.append((child_id, nullable_prefix, guarded, edge_kind))
+                pending.append(child)
+
+            for ignore in element.ignoreExprs:
+                pending.append(ignore)
+                outgoing.append((id(ignore), True, False, "ignore"))
+
+    def _child_specs(
+        self, element: ParserElement
+    ) -> list[tuple[ParserElement, bool, bool, str]]:
+        if self._is_unknown(element):
+            if element not in self.unknown_elements:
+                self.unknown_elements.append(element)
+            if (
+                isinstance(element, ParseElementEnhance)
+                and not isinstance(element, Forward)
+                and element.expr is not None
+            ):
+                return [(element.expr, True, False, "unknown")]
+            if isinstance(element, ParseExpression):
+                return [(child, True, False, "unknown") for child in element.exprs]
+            return []
+
+        if isinstance(element, ParseExpression):
+            if isinstance(element, And):
+                return [
+                    (
+                        child,
+                        True,
+                        False,
+                        "and",
+                    )
+                    for child_index, child in enumerate(element.exprs)
+                ]
+            if isinstance(element, (Or, MatchFirst, Each)):
+                edge_kind = "branch"
+                return [(child, False, False, edge_kind) for child in element.exprs]
+
+        if isinstance(element, Forward):
+            if element.expr is None:
+                return []
+            return [(element.expr, True, False, "zero_width")]
+
+        if isinstance(element, ParseElementEnhance):
+            if isinstance(element, (FollowedBy, NotAny)):
+                return [(element.expr, True, False, "lookahead")]
+            if isinstance(element, (Opt, ZeroOrMore)):
+                children = [(element.expr, True, False, "zero_width")]
+                if getattr(element, "not_ender", None) is not None:
+                    children.extend(self._stop_specs(element.not_ender))
+                return children
+            if isinstance(element, OneOrMore):
+                children = [(element.expr, True, False, "zero_width")]
+                if getattr(element, "not_ender", None) is not None:
+                    children.extend(self._stop_specs(element.not_ender))
+                return children
+            if isinstance(element, SkipTo):
+                children: list[tuple[ParserElement, bool, bool, str]] = [
+                    (element.expr, True, True, "guarded")
+                ]
+                if element.failOn is not None:
+                    children.append((element.failOn, True, False, "zero_width"))
+                return children
+            edge_kind = "zero_width"
+            return [
+                (
+                    element.expr,
+                    isinstance(element, PrecededBy),
+                    isinstance(element, PrecededBy),
+                    edge_kind,
+                )
+            ]
+
+        if isinstance(element, _PendingSkip):
+            return [(element.anchor, True, False, "zero_width")]
+
+        return []
+
+    def _stop_specs(
+        self, stop_element: ParserElement
+    ) -> list[tuple[ParserElement, bool, bool, str]]:
+        return [
+            (child, True, False, "stop")
+            for child, _, _, _ in self._child_specs(stop_element)
+        ]
+
+    def _initial_nullable(self, element: ParserElement) -> int:
+        type_name = type(element).__name__
+        if isinstance(element, Empty):
+            return self._TRUE
+        if isinstance(element, NoMatch):
+            return self._FALSE
+        if isinstance(element, Forward) and getattr(element.expr, "match", None) == "":
+            return self._TRUE
+        if type_name in self._NEVER_NULLABLE_LEAF_NAMES:
+            return self._FALSE
+        if type_name in self._ALWAYS_NULLABLE_LEAF_NAMES:
+            return self._TRUE
+        if isinstance(element, White):
+            return self._TRUE if element.minLen == 0 else self._FALSE
+        if isinstance(element, Regex):
+            try:
+                return self._bool_to_tristate(element.mayReturnEmpty)
+            except Exception:
+                return self._UNKNOWN
+        if isinstance(
+            element, (ParseExpression, ParseElementEnhance, _PendingSkip)
+        ):
+            return self._TRUE
+        return self._UNKNOWN
+
+    def _infer_nullability(self) -> None:
+        changed = True
+        while changed:
+            changed = False
+            for element_id, element in self.nodes.items():
+                inferred = self._infer_element_nullability(element)
+                if inferred is not None and inferred != self.nullable[element_id]:
+                    self.nullable[element_id] = inferred
+                    changed = True
+    def _infer_element_nullability(
+        self, element: ParserElement
+    ) -> typing.Optional[int]:
+        if self._is_unknown(element):
+            return None
+        if isinstance(element, And):
+            return self._all_nullable(element.exprs)
+        if isinstance(element, (Or, MatchFirst, Each)):
+            return self._any_nullable(element.exprs)
+        if isinstance(element, Forward):
+            if element.expr is None:
+                return None
+            return self.nullable[id(element.expr)]
+        if isinstance(element, ParseElementEnhance):
+            if isinstance(element, (FollowedBy, NotAny, Opt, ZeroOrMore)):
+                return self._TRUE
+            if isinstance(element, OneOrMore):
+                return self.nullable[id(element.expr)]
+            if isinstance(element, SkipTo):
+                return self._TRUE
+            return self.nullable[id(element.expr)]
+        if isinstance(element, _PendingSkip):
+            return self.nullable[id(element.anchor)]
+        return None
+
+    def _all_nullable(self, elements: typing.Iterable[ParserElement]) -> int:
+        result = self._TRUE
+        for element in elements:
+            result = min(result, self.nullable[id(element)])
+        return result
+
+    def _any_nullable(self, elements: typing.Iterable[ParserElement]) -> int:
+        result = self._FALSE
+        for element in elements:
+            result = max(result, self.nullable[id(element)])
+        return result
+
+    def _bool_to_tristate(self, value: typing.Any) -> int:
+        if value is None:
+            return self._UNKNOWN
+        return self._TRUE if value else self._FALSE
+
+    def _is_unknown(self, element: ParserElement) -> bool:
+        if type(element).__name__ in self._KNOWN_LEAF_NAMES:
+            return False
+        for base_class in (
+            ParseExpression,
+            Forward,
+        ):
+            if isinstance(element, base_class) and type(element).parseImpl is getattr(
+                base_class, "parseImpl", None
+            ):
+                return False
+        if (
+            isinstance(element, FollowedBy)
+            and type(element).__mro__[1] is FollowedBy
+            and len(element.recurse()) == 1
+        ):
+            return False
+        for base_class in (
+            PrecededBy,
+            Located,
+            NotAny,
+            OneOrMore,
+            ZeroOrMore,
+            DelimitedList,
+            Opt,
+            SkipTo,
+            Combine,
+            Group,
+            Dict,
+            Suppress,
+            IndentedBlock,
+        ):
+            if isinstance(element, base_class) and type(element).parseImpl is getattr(
+                base_class, "parseImpl", None
+            ):
+                return False
+        known = (
+            {
+                NoMatch,
+                Regex,
+                White,
+                And,
+                Or,
+                MatchFirst,
+                Each,
+                Forward,
+                FollowedBy,
+                PrecededBy,
+                Located,
+                NotAny,
+                OneOrMore,
+                ZeroOrMore,
+                DelimitedList,
+                Opt,
+                SkipTo,
+                TokenConverter,
+                Combine,
+                Group,
+                Dict,
+                Suppress,
+                IndentedBlock,
+                AtStringStart,
+                AtLineStart,
+                _PendingSkip,
+            }
+        )
+        return type(element) not in known
+
+    def _find_recursions(self) -> list[GrammarRecursion]:
+        index = 0
+        indices: dict[int, int] = {}
+        low: dict[int, int] = {}
+        stack: list[int] = []
+        on_stack: set[int] = set()
+        components: list[set[int]] = []
+
+        root_id = id(self.grammar)
+        work: list[tuple[int, int]] = [(root_id, 0)]
+        indices[root_id] = index
+        low[root_id] = index
+        index += 1
+        stack.append(root_id)
+        on_stack.add(root_id)
+
+        while work:
+            node_id, edge_position = work[-1]
+            outgoing = self.edges.get(node_id, [])
+            if edge_position < len(outgoing):
+                child_id = outgoing[edge_position][0]
+                work[-1] = (node_id, edge_position + 1)
+                if child_id not in indices:
+                    indices[child_id] = index
+                    low[child_id] = index
+                    index += 1
+                    stack.append(child_id)
+                    on_stack.add(child_id)
+                    work.append((child_id, 0))
+                elif child_id in on_stack:
+                    low[node_id] = min(low[node_id], indices[child_id])
+            else:
+                work.pop()
+                if low[node_id] == indices[node_id]:
+                    component: set[int] = set()
+                    while True:
+                        child_id = stack.pop()
+                        on_stack.remove(child_id)
+                        component.add(child_id)
+                        if child_id == node_id:
+                            break
+                    if len(component) > 1 or any(
+                        child_id == node_id
+                        for child_id, _, _, _ in outgoing
+                    ):
+                        components.append(component)
+                if work:
+                    parent_id = work[-1][0]
+                    low[parent_id] = min(low[parent_id], low[node_id])
+
+        recursions: list[GrammarRecursion] = []
+        for component in components:
+            cycles: dict[GrammarRecursionKind, list[ParserElement]] = {}
+            seen_cycles: set[tuple[tuple[int, int], ...]] = set()
+
+            def find_cycle(start_id: int) -> None:
+                pending = [
+                    (
+                        start_id,
+                        [self.nodes[start_id]],
+                        self._TRUE,
+                        False,
+                        False,
+                        False,
+                        False,
+                        False,
+                        frozenset(),
+                        (),
+                    )
+                ]
+                while pending:
+                    (
+                        current_id,
+                        path,
+                            nullable_state,
+                            consumed,
+                            guarded,
+                            unknown,
+                            lookahead,
+                            left_edge,
+                            choices,
+                            edge_path,
+                    ) = pending.pop()
+
+                    for edge_index, (
+                        child_id,
+                        nullable_prefix,
+                        edge_guarded,
+                        edge_kind,
+                    ) in enumerate(self.edges.get(current_id, [])):
+                        if child_id not in component:
+                            continue
+
+                        choice = None
+                        if edge_kind == "branch":
+                            choice = current_id
+
+                        if choice is not None:
+                            if choice in choices:
+                                continue
+                            next_choices = choices | {choice}
+                        else:
+                            next_choices = choices
+
+                        child_nullable = self.nullable[child_id]
+                        next_edge = (current_id, edge_index)
+                        new_edge_path = edge_path + (next_edge,)
+                        edge_consumes = (
+                            not nullable_prefix
+                            and child_nullable != self._TRUE
+                            and not isinstance(
+                                self.nodes[child_id],
+                                (ParseExpression, ParseElementEnhance),
+                            )
+                        )
+
+                        if nullable_prefix:
+                            next_nullable = min(nullable_state, child_nullable)
+                            exit_state = self._exit_state_from(child_id, component)
+                        else:
+                            next_nullable = self._FALSE
+                            exit_state = self._FALSE
+                        and_prefix_consumed = False
+                        if isinstance(self.nodes[current_id], And):
+                            and_prefix_consumed = any(
+                                self.nullable[id(sibling)] == self._FALSE
+                                for sibling in self.nodes[current_id].exprs[:edge_index]
+                            )
+                        next_consumed = (
+                            consumed or edge_consumes or and_prefix_consumed
+                        )
+
+                        next_guarded = guarded or edge_guarded
+                        next_lookahead = lookahead or edge_kind == "lookahead"
+                        next_unknown = unknown or (
+                            self.nodes[child_id] in self.unknown_elements
+                            or edge_kind == "unknown"
+                            or (nullable_prefix and child_nullable == self._UNKNOWN)
+                        )
+                        next_left_edge = not edge_consumes and (
+                            left_edge
+                            or (
+                                not consumed
+                                and nullable_prefix
+                                and (
+                                    isinstance(self.nodes[current_id], Forward)
+                                    or edge_kind in {"zero_width", "guarded", "ignore"}
+                                )
+                            )
+                        )
+
+                        if child_id == start_id:
+                            closure_nullable = nullable_state
+                            if nullable_prefix:
+                                closure_nullable = min(
+                                    closure_nullable, child_nullable
+                                )
+                            if next_lookahead:
+                                kind = GrammarRecursionKind.no_progress_loop
+                            elif edge_kind == "ignore" and child_nullable == self._TRUE:
+                                kind = GrammarRecursionKind.no_progress_loop
+                            elif next_consumed or next_guarded:
+                                kind = GrammarRecursionKind.terminating_recursion
+                            elif closure_nullable == self._UNKNOWN or next_unknown:
+                                kind = GrammarRecursionKind.unknown_recursion
+                            elif next_left_edge and not next_consumed:
+                                if exit_state == self._FALSE:
+                                    kind = GrammarRecursionKind.left_recursion
+                                elif exit_state == self._UNKNOWN:
+                                    kind = GrammarRecursionKind.unknown_recursion
+                                else:
+                                    kind = GrammarRecursionKind.no_progress_loop
+                            else:
+                                kind = GrammarRecursionKind.no_progress_loop
+
+                            key = tuple(sorted(new_edge_path))
+                            if key not in seen_cycles:
+                                seen_cycles.add(key)
+                                cycles.setdefault(
+                                    kind, path + [self.nodes[start_id]]
+                                )
+                            continue
+
+                        if next_edge in edge_path or child_id in {
+                            id(node) for node in path
+                        }:
+                            continue
+
+                        pending.append(
+                            (
+                                child_id,
+                                path + [self.nodes[child_id]],
+                                next_nullable,
+                                next_consumed,
+                                next_guarded,
+                                next_unknown,
+                                next_lookahead,
+                                next_left_edge,
+                                next_choices,
+                                new_edge_path,
+                            )
+                        )
+
+            for node_id in component:
+                element = self.nodes[node_id]
+                has_ignore_edge = any(
+                    edge_kind == "ignore"
+                    for _, _, _, edge_kind in self.edges.get(node_id, [])
+                )
+                if isinstance(element, Forward) or has_ignore_edge:
+                    find_cycle(node_id)
+
+            for kind in (
+                GrammarRecursionKind.no_progress_loop,
+                GrammarRecursionKind.left_recursion,
+                GrammarRecursionKind.unknown_recursion,
+                GrammarRecursionKind.terminating_recursion,
+            ):
+                if kind in cycles:
+                    path = cycles[kind]
+                    recursions.append(
+                        GrammarRecursion(
+                            kind,
+                            tuple(path),
+                            kind is GrammarRecursionKind.no_progress_loop,
+                        )
+                    )
+
+        return recursions
+
+    def _exit_state_from(self, start_id: int, component: set[int]) -> int:
+        pending = [(start_id, (start_id,))]
+        result = self._TRUE
+        while pending:
+            node_id, visited = pending.pop()
+            if node_id in visited[:-1]:
+                continue
+            for child_id, nullable_prefix, _, _ in self.edges.get(node_id, []):
+                if child_id == start_id:
+                    continue
+                child_nullable = self.nullable[child_id]
+                if child_nullable == self._FALSE:
+                    result = self._combine_exit_states(result, self._FALSE)
+                elif child_nullable == self._UNKNOWN and nullable_prefix:
+                    result = self._combine_exit_states(result, self._UNKNOWN)
+                if nullable_prefix:
+                    pending.append((child_id, visited + (child_id,)))
+        return result
+
+    @staticmethod
+    def _combine_exit_states(first: int, second: int) -> int:
+        if first == 0 or second == 0:
+            return 0
+        if first == 1 or second == 1:
+            return 1
+        return 2
 
 
 def enable_diag(diag_enum: Diagnostics) -> None:
@@ -2247,6 +2988,17 @@ class ParserElement(ABC):
             stacklevel=2,
         )
         self._checkRecursion([])
+
+    def validate_grammar(
+        self,
+        *,
+        left_recursion: typing.Optional[bool] = None,
+    ) -> GrammarValidationReport:
+        """
+        Statically check this grammar for left recursion and no-progress loops.
+        See :func:`validate_grammar`.
+        """
+        return validate_grammar(self, left_recursion=left_recursion)
 
     def parse_file(
         self,
@@ -6235,6 +6987,7 @@ class Forward(ParseElementEnhance):
         self.saveAsList = self.expr.saveAsList
         self.ignoreExprs.extend(self.expr.ignoreExprs)
         self.lshift_line = traceback.extract_stack(limit=2)[-2]  # type: ignore[assignment]
+        self._defaultName = None
         return self
 
     def __ilshift__(self, other) -> Forward:
